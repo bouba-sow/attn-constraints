@@ -140,3 +140,22 @@ def test_window_run_names_and_validation():
     assert make_config("window", "2l", window_size=14).window_size == 14
     with pytest.raises(ValueError):
         make_config("window", "2l")
+
+
+def test_run_lock_blocks_second_process_and_takes_over_stale(data_root, tmp_path):
+    run_dir = tmp_path / "runs" / "forget_test_s1"
+    run_dir.mkdir(parents=True)
+    first, second = train.RunLock(run_dir), train.RunLock(run_dir)
+    assert first.acquire() and not second.acquire()
+    # The training entry point skips a locked run with EXIT_LOCKED and leaves the lock alone.
+    args = ["--attn", "forget", *COMMON]
+    assert run(args, data_root, tmp_path / "runs") == train.EXIT_LOCKED
+    assert (run_dir / "RUNNING").exists()
+    # A lock whose heartbeat is older than stale_after is taken over.
+    stale = train.RunLock(run_dir, stale_after=0.0)
+    assert stale.acquire()
+    stale.release()
+    assert not (run_dir / "RUNNING").exists()
+    # A normal run releases its lock when it finishes.
+    assert run(args, data_root, tmp_path / "runs") == 0
+    assert not (run_dir / "RUNNING").exists() and (run_dir / "DONE").exists()

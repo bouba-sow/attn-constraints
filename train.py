@@ -43,6 +43,7 @@ from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights
 
 REPO_DIR = Path(__file__).resolve().parent
 EXIT_INTERRUPTED = 99
+EXIT_LOCKED = 98  # another process holds the run's RUNNING lock
 LOG_FIELDS = ["step", "tokens", "train_loss", "val_loss", "lr", "grad_norm", "tokens_per_s", "peak_mem_gb"]
 
 
@@ -73,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=500)
-    p.add_argument("--eval-batch", type=int, default=32)
+    p.add_argument("--eval-batch", type=int, default=8)
     p.add_argument("--eval-max-windows", type=int, default=None, help="cap validation (pilot only)")
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--no-save-init", action="store_true", help="skip checkpoints/step_00000")
@@ -162,6 +163,10 @@ def evaluate(model, val: TokenWindows, args, amp_dtype) -> float:
         total += lm_loss(model, batch, amp_dtype).item() * len(idx)
         count += len(idx)
     model.train()
+    if torch.cuda.is_available():
+        # Several runs share one GPU under MPS: hand the evaluation's cached blocks back so a
+        # neighbour evaluating at the same moment does not run out of memory.
+        torch.cuda.empty_cache()
     return total / count
 
 
@@ -284,6 +289,56 @@ def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
         raise SystemExit(f"resume.pt was written with different settings: {changed}")
 
 
+class RunLock:
+    """``RUNNING`` file in the run directory, so one run never trains in two processes at once
+    (e.g. a crashed run relaunched elsewhere while its original job is still alive).
+
+    Created with O_EXCL (atomic on the shared filesystem) and refreshed by ``heartbeat()``; a
+    lock whose heartbeat is older than ``stale_after`` seconds belongs to a process that was
+    killed without cleaning up, and is taken over.
+    """
+
+    def __init__(self, run_dir: Path, stale_after: float = 900.0):
+        self.path = run_dir / "RUNNING"
+        self.stale_after = stale_after
+        self.held = False
+
+    def acquire(self) -> bool:
+        owner = f"host={platform.node()} pid={os.getpid()} job={os.environ.get('SLURM_JOB_ID')}\n"
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < self.stale_after:
+                    holder = self.path.read_text().strip() if self.path.exists() else "?"
+                    print(f"locked by another process ({holder}, heartbeat {age:.0f}s ago)", flush=True)
+                    return False
+                print(f"taking over a stale lock (heartbeat {age:.0f}s ago)", flush=True)
+                self.path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(fd, "w") as fh:
+                fh.write(owner)
+            self.held = True
+            return True
+        return False
+
+    def heartbeat(self) -> None:
+        if self.held:
+            try:
+                os.utime(self.path)
+            except FileNotFoundError:
+                pass
+
+    def release(self) -> None:
+        if self.held:
+            self.path.unlink(missing_ok=True)
+            self.held = False
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     run_dir = args.runs_root / args.run_name
@@ -291,6 +346,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.run_name}: already done", flush=True)
         return 0
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    lock = RunLock(run_dir)
+    if not lock.acquire():
+        print(f"{args.run_name}: skipped, another process is training it", flush=True)
+        return EXIT_LOCKED
+    try:
+        return train_run(args, run_dir, lock)
+    finally:
+        lock.release()
+
+
+def train_run(args: argparse.Namespace, run_dir: Path, lock: RunLock) -> int:
     tokenizer_dir = args.data_root / "tokenizer"
     manifest_path = args.data_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -432,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.device.startswith("cuda") else "",
             }
             log.write(row)
+            lock.heartbeat()
             print(" ".join(f"{k}={v}" for k, v in row.items() if v != ""), flush=True)
             if tb is not None:
                 tb.add_scalar("train/loss", row["train_loss"], step)
