@@ -1,0 +1,35 @@
+[project]
+name = "attn-constraints"
+version = "0.1.0"
+description = "Matched suite of small OPT-style LMs that differ only in their attention constraint"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Same torch/transformers as the benchmark venv on Torch, so checkpoints are produced and checked
+    # with the stack that scores them. The model code itself only needs torch + transformers.
+    "torch==2.6.0",
+    "transformers==5.13.1",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.26",
+    "numpy>=1.26",
+    "zstandard>=0.22",
+    "tensorboard>=2.17",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+# CUDA 12.4 wheels: run on A100/H100/H200, and on L40S (sm_86 cubins run on sm_89).
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
