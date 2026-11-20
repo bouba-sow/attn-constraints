@@ -80,6 +80,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     p.add_argument("--compile", action="store_true", help="torch.compile the model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--trackio-space", default=os.environ.get("TRACKIO_SPACE_ID") or None,
+                   help="HF Space for the live Trackio dashboard, e.g. user/attn-constraints-dashboard "
+                        "(default: $TRACKIO_SPACE_ID; unset = no Trackio, TensorBoard only)")
+    p.add_argument("--trackio-project", default=os.environ.get("TRACKIO_PROJECT", "attn-constraints"))
     args = p.parse_args(argv)
     if args.data_root is None or args.runs_root is None:
         p.error("--data-root and --runs-root are required when $SCRATCH is not set")
@@ -191,6 +195,51 @@ class CsvLog:
     def write(self, row: dict) -> None:
         with open(self.path, "a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=LOG_FIELDS).writerow({k: row.get(k, "") for k in LOG_FIELDS})
+
+
+class Tracker:
+    """Optional live dashboard (Trackio, synced to a Hugging Face Space).
+
+    Logging must never stop training: any Trackio error disables it for the rest of the run and
+    leaves train_log.csv and TensorBoard as the record.
+    """
+
+    def __init__(self, args: argparse.Namespace, config: dict, resuming: bool):
+        self.run = None
+        if not args.trackio_space:
+            return
+        try:
+            import trackio
+
+            self._trackio = trackio
+            self.run = trackio.init(
+                project=args.trackio_project,
+                name=args.run_name,
+                group=f"{args.size}_s{args.seed}",  # one matched set per group
+                space_id=args.trackio_space,
+                config=config,
+                resume="allow" if resuming else "never",
+                private=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: Trackio disabled ({type(exc).__name__}: {exc})", flush=True)
+
+    def log(self, metrics: dict, step: int) -> None:
+        if self.run is None:
+            return
+        try:
+            self._trackio.log(metrics, step=step)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: Trackio disabled ({type(exc).__name__}: {exc})", flush=True)
+            self.run = None
+
+    def finish(self) -> None:
+        if self.run is None:
+            return
+        try:
+            self._trackio.finish()
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: Trackio finish failed ({type(exc).__name__}: {exc})", flush=True)
 
 
 class StopFlag:
@@ -310,6 +359,16 @@ def main(argv: list[str] | None = None) -> int:
         tb = SummaryWriter(run_dir / "tb", purge_step=start_step)
     except ImportError:
         tb = None
+    tracker = Tracker(
+        args,
+        config={
+            "attn": args.attn, "size": args.size, "seed": args.seed, "n_params": n_params,
+            "lr": args.lr, "batch_tokens": tokens_per_step, "max_steps": args.max_steps,
+            "micro_batch": args.micro_batch, "precision": str(amp_dtype or torch.float32),
+            "gpu": torch.cuda.get_device_name() if args.device.startswith("cuda") else None,
+        },
+        resuming=start_step > 0,
+    )
     step_fn_model = torch.compile(model) if args.compile else model
     stop = StopFlag()
     n_micro = args.batch_seqs // args.micro_batch
@@ -371,6 +430,13 @@ def main(argv: list[str] | None = None) -> int:
                 tb.add_scalar("train/tokens_per_s", row["tokens_per_s"], step)
                 if val_loss is not None:
                     tb.add_scalar("val/loss", val_loss, step)
+            metrics = {
+                "train/loss": row["train_loss"], "train/lr": lr, "train/grad_norm": grad_norm,
+                "train/tokens_per_s": row["tokens_per_s"], "train/tokens": row["tokens"],
+            }
+            if val_loss is not None:
+                metrics["val/loss"] = val_loss
+            tracker.log(metrics, step)
             window_loss, window_steps, window_t0 = 0.0, 0, time.time()
 
         if step % args.ckpt_every == 0 and step < args.max_steps:
@@ -381,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             save_resume(resume_path, model, optimizer, scaler, step, args)
             if stop.stop:
                 print(f"{args.run_name}: stopped at step {step}, resume state saved", flush=True)
+                tracker.finish()
                 return EXIT_INTERRUPTED
 
     save_hf(model, run_dir / "final", tokenizer_dir)
@@ -403,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     (run_dir / "DONE").write_text(datetime.now(timezone.utc).isoformat(timespec="seconds") + "\n")
+    tracker.finish()
     resume_path.unlink(missing_ok=True)
     if tb is not None:
         tb.close()

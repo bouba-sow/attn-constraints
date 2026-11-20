@@ -1,6 +1,7 @@
 """Training loop on synthetic data (CPU): it learns, and a killed run resumes exactly."""
 
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -65,6 +66,41 @@ def test_resume_is_exact(data_root, tmp_path, monkeypatch):
     assert [int(r.split(",")[0]) for r in log[1:]] == [1, 2, 3, 4, 5, 6]
     # A finished run is skipped when relaunched.
     assert run(args, data_root, tmp_path / "b") == 0
+
+
+class FakeTrackio:
+    """Records calls; ``fail_after`` makes log() raise, as a network error would."""
+
+    def __init__(self, fail_after=None):
+        self.inits, self.logged, self.finished, self.fail_after = [], [], 0, fail_after
+
+    def init(self, **kwargs):
+        self.inits.append(kwargs)
+        return object()
+
+    def log(self, metrics, step=None):
+        if self.fail_after is not None and len(self.logged) >= self.fail_after:
+            raise ConnectionError("Space unreachable")
+        self.logged.append((step, metrics))
+
+    def finish(self):
+        self.finished += 1
+
+
+@pytest.mark.parametrize("fail_after", [None, 2])
+def test_trackio_logging_never_stops_training(data_root, tmp_path, monkeypatch, fail_after):
+    fake = FakeTrackio(fail_after)
+    monkeypatch.setitem(sys.modules, "trackio", fake)
+    args = ["--attn", "alibi", *COMMON, "--trackio-space", "user/space", "--trackio-project", "p"]
+    assert run(args, data_root, tmp_path) == 0
+    assert fake.inits[0]["space_id"] == "user/space" and fake.inits[0]["name"] == "alibi_test_s1"
+    assert fake.inits[0]["group"] == "test_s1"
+    if fail_after is None:
+        assert [s for s, _ in fake.logged] == [1, 2, 3, 4, 5, 6]
+        assert "val/loss" in dict(fake.logged)[3] and fake.finished == 1
+    else:
+        assert len(fake.logged) == 2 and fake.finished == 0  # disabled after the failure
+    assert (tmp_path / "alibi_test_s1" / "DONE").exists()
 
 
 def test_loss_decreases_and_matched_init(data_root, tmp_path):

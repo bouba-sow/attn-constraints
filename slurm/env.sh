@@ -15,6 +15,11 @@ export DATA_ROOT="${DATA_ROOT:-$SCRATCH/attn_constraints/data}"
 export RUNS_ROOT="${RUNS_ROOT:-$SCRATCH/attn_constraints/runs}"
 export PILOT_ROOT="${PILOT_ROOT:-$SCRATCH/attn_constraints/pilot}"
 
+# Live Trackio dashboard (private HF Space, created on first use; needs HF_TOKEN with write
+# access). Set TRACKIO_SPACE_ID="" to turn it off; TensorBoard logs are written regardless.
+export TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID-boubasow/attn-constraints-dashboard}"
+export TRACKIO_PROJECT="${TRACKIO_PROJECT:-attn-constraints}"
+
 # Job scripts run with the submit directory as cwd; submit from the repository root.
 REPO_DIR="${REPO_DIR:-$SLURM_SUBMIT_DIR}"
 if [[ ! -f "$REPO_DIR/train.py" ]]; then

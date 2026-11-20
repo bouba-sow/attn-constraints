@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -6,6 +7,8 @@ import torch
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
+# Tests never log to a real Trackio Space.
+os.environ.pop("TRACKIO_SPACE_ID", None)
 # Login nodes are shared: many intra-op threads make small CPU tests orders of magnitude slower.
 torch.set_num_threads(min(4, torch.get_num_threads()))
 

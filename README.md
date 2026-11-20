@@ -139,6 +139,17 @@ Relaunching is safe: runs with `DONE` are skipped and unfinished runs resume fro
 On SIGTERM/SIGUSR1 (time limit, preemption) each run saves `resume.pt` after its current step
 and exits with code 99.
 
+**Live dashboard (Trackio).** Every run logs train/validation loss, learning rate, gradient
+norm and tokens/s to a private Hugging Face Space,
+[`boubasow/attn-constraints-dashboard`](https://huggingface.co/spaces/boubasow/attn-constraints-dashboard).
+The Space is created on first use and needs `HF_TOKEN` with write access in the submitting shell.
+- Runs are grouped by matched set (`{size}_s{seed}`). Grid runs log to project
+  `attn-constraints`, pilot runs to `attn-constraints-pilot`.
+- Set `TRACKIO_SPACE_ID=""` to turn it off. A Trackio error never stops training: it disables
+  the dashboard for that run, and `train_log.csv` and TensorBoard (`tb/`) stay the record.
+- TensorBoard without a Space: `tensorboard --logdir $RUNS_ROOT` on a login node, opened through
+  `ssh -L 6006:localhost:6006`.
+
 **4. Checks after training**:
 
 ```bash
