@@ -82,10 +82,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     p.add_argument("--compile", action="store_true", help="torch.compile the model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--trackio-space", default=os.environ.get("TRACKIO_SPACE_ID") or None,
-                   help="HF Space for the live Trackio dashboard, e.g. user/attn-constraints-dashboard "
-                        "(default: $TRACKIO_SPACE_ID; unset = no Trackio, TensorBoard only)")
-    p.add_argument("--trackio-project", default=os.environ.get("TRACKIO_PROJECT", "attn-constraints"))
+    p.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT") or None,
+                   help="wandb project for the live dashboard (default: $WANDB_PROJECT; "
+                        "unset = no wandb, TensorBoard only)")
+    p.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY") or None)
     args = p.parse_args(argv)
     if args.data_root is None or args.runs_root is None:
         p.error("--data-root and --runs-root are required when $SCRATCH is not set")
@@ -203,49 +203,51 @@ class CsvLog:
 
 
 class Tracker:
-    """Optional live dashboard (Trackio, synced to a Hugging Face Space).
+    """Optional live dashboard (Weights & Biases).
 
-    Logging must never stop training: any Trackio error disables it for the rest of the run and
-    leaves train_log.csv and TensorBoard as the record.
+    The wandb run id is derived from the run directory, so a restarted (resumed) run continues
+    the same wandb run. Logging must never stop training: any wandb error disables it for the
+    rest of the run and leaves train_log.csv and TensorBoard as the record.
     """
 
-    def __init__(self, args: argparse.Namespace, config: dict, resuming: bool):
+    def __init__(self, args: argparse.Namespace, config: dict, run_dir: Path):
         self.run = None
-        if not args.trackio_space:
+        if not args.wandb_project:
             return
         try:
-            import trackio
+            import wandb
 
-            self._trackio = trackio
-            self.run = trackio.init(
-                project=args.trackio_project,
+            run_id = f"{args.run_name}-{hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:8]}"
+            self.run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
                 name=args.run_name,
                 group=f"{args.size}_s{args.seed}",  # one matched set per group
-                space_id=args.trackio_space,
+                job_type=args.attn_label,
+                id=run_id,
+                resume="allow",
                 config=config,
-                resume="allow" if resuming else "never",
-                # Public: a free HF account cannot create private Spaces (402 Payment Required).
-                private=os.environ.get("TRACKIO_PRIVATE", "0") == "1",
+                dir=str(run_dir),
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: Trackio disabled ({type(exc).__name__}: {exc})", flush=True)
+            print(f"WARNING: wandb disabled ({type(exc).__name__}: {exc})", flush=True)
 
     def log(self, metrics: dict, step: int) -> None:
         if self.run is None:
             return
         try:
-            self._trackio.log(metrics, step=step)
+            self.run.log(metrics, step=step)
         except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: Trackio disabled ({type(exc).__name__}: {exc})", flush=True)
+            print(f"WARNING: wandb disabled ({type(exc).__name__}: {exc})", flush=True)
             self.run = None
 
     def finish(self) -> None:
         if self.run is None:
             return
         try:
-            self._trackio.finish()
+            self.run.finish()
         except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: Trackio finish failed ({type(exc).__name__}: {exc})", flush=True)
+            print(f"WARNING: wandb finish failed ({type(exc).__name__}: {exc})", flush=True)
 
 
 class StopFlag:
@@ -375,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             "micro_batch": args.micro_batch, "precision": str(amp_dtype or torch.float32),
             "gpu": torch.cuda.get_device_name() if args.device.startswith("cuda") else None,
         },
-        resuming=start_step > 0,
+        run_dir=run_dir,
     )
     step_fn_model = torch.compile(model) if args.compile else model
     stop = StopFlag()

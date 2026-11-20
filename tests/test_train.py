@@ -68,19 +68,20 @@ def test_resume_is_exact(data_root, tmp_path, monkeypatch):
     assert run(args, data_root, tmp_path / "b") == 0
 
 
-class FakeTrackio:
-    """Records calls; ``fail_after`` makes log() raise, as a network error would."""
+class FakeWandb:
+    """Stands in for the wandb module. Records calls; ``fail_after`` makes run.log() raise,
+    as a network error would."""
 
     def __init__(self, fail_after=None):
         self.inits, self.logged, self.finished, self.fail_after = [], [], 0, fail_after
 
     def init(self, **kwargs):
         self.inits.append(kwargs)
-        return object()
+        return self
 
     def log(self, metrics, step=None):
         if self.fail_after is not None and len(self.logged) >= self.fail_after:
-            raise ConnectionError("Space unreachable")
+            raise ConnectionError("wandb unreachable")
         self.logged.append((step, metrics))
 
     def finish(self):
@@ -88,19 +89,31 @@ class FakeTrackio:
 
 
 @pytest.mark.parametrize("fail_after", [None, 2])
-def test_trackio_logging_never_stops_training(data_root, tmp_path, monkeypatch, fail_after):
-    fake = FakeTrackio(fail_after)
-    monkeypatch.setitem(sys.modules, "trackio", fake)
-    args = ["--attn", "alibi", *COMMON, "--trackio-space", "user/space", "--trackio-project", "p"]
+def test_wandb_logging_never_stops_training(data_root, tmp_path, monkeypatch, fail_after):
+    fake = FakeWandb(fail_after)
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    args = ["--attn", "alibi", *COMMON, "--wandb-project", "p"]
     assert run(args, data_root, tmp_path) == 0
-    assert fake.inits[0]["space_id"] == "user/space" and fake.inits[0]["name"] == "alibi_test_s1"
-    assert fake.inits[0]["group"] == "test_s1"
+    init = fake.inits[0]
+    assert init["project"] == "p" and init["name"] == "alibi_test_s1" and init["group"] == "test_s1"
+    assert init["id"].startswith("alibi_test_s1-") and init["resume"] == "allow"
     if fail_after is None:
         assert [s for s, _ in fake.logged] == [1, 2, 3, 4, 5, 6]
         assert "val/loss" in dict(fake.logged)[3] and fake.finished == 1
     else:
         assert len(fake.logged) == 2 and fake.finished == 0  # disabled after the failure
     assert (tmp_path / "alibi_test_s1" / "DONE").exists()
+
+
+def test_wandb_run_id_is_stable_across_restarts(data_root, tmp_path, monkeypatch):
+    ids = []
+    for _ in range(2):
+        fake = FakeWandb()
+        monkeypatch.setitem(sys.modules, "wandb", fake)
+        monkeypatch.setattr(train, "StopFlag", lambda: StopAfter(2))
+        run(["--attn", "forget", *COMMON, "--wandb-project", "p"], data_root, tmp_path)
+        ids.append(fake.inits[0]["id"])
+    assert ids[0] == ids[1]
 
 
 def test_loss_decreases_and_matched_init(data_root, tmp_path):

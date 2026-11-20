@@ -15,11 +15,13 @@ export DATA_ROOT="${DATA_ROOT:-$SCRATCH/attn_constraints/data}"
 export RUNS_ROOT="${RUNS_ROOT:-$SCRATCH/attn_constraints/runs}"
 export PILOT_ROOT="${PILOT_ROOT:-$SCRATCH/attn_constraints/pilot}"
 
-# Live Trackio dashboard (public HF Space, created on first use; needs HF_TOKEN with write
-# access; TRACKIO_PRIVATE=1 for a private Space, which needs a paid account).
-# Set TRACKIO_SPACE_ID="" to turn it off; TensorBoard logs are written regardless.
-export TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID-boubasow/attn-constraints-dashboard}"
-export TRACKIO_PROJECT="${TRACKIO_PROJECT:-attn-constraints}"
+# Live wandb dashboard. The API key comes from ~/.netrc (`wandb login`), never from this repo.
+# Set WANDB_PROJECT="" to turn it off; TensorBoard logs are written regardless.
+export WANDB_PROJECT="${WANDB_PROJECT-attn-constraints}"
+export WANDB_ENTITY="${WANDB_ENTITY:-}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$SCRATCH/.cache/wandb}"
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-$SCRATCH/.cache/wandb-data}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-$SCRATCH/.config/wandb}"
 
 # Job scripts run with the submit directory as cwd; submit from the repository root.
 REPO_DIR="${REPO_DIR:-$SLURM_SUBMIT_DIR}"

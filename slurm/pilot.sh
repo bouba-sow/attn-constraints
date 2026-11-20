@@ -21,7 +21,7 @@ set -uo pipefail
 source "${SLURM_SUBMIT_DIR:-.}/slurm/env.sh"
 MODE="${MODE:-single}"
 # Keep pilot runs out of the main dashboard project.
-export TRACKIO_PROJECT="${TRACKIO_PROJECT_PILOT:-attn-constraints-pilot}"
+export WANDB_PROJECT="${WANDB_PROJECT_PILOT-attn-constraints-pilot}"
 echo "host=$(hostname) job=${SLURM_JOB_ID:-} mode=$MODE"
 echo "CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-<unset: MPS not active>}"
 nvidia-smi --query-gpu=name,memory.total,compute_mode --format=csv,noheader
