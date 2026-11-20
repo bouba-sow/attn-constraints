@@ -16,6 +16,8 @@ SIZES = {
     "2l": dict(num_hidden_layers=2, hidden_size=256, num_attention_heads=4, ffn_dim=1024),
     "4l": dict(num_hidden_layers=4, hidden_size=384, num_attention_heads=6, ffn_dim=1536),
     "125m": dict(num_hidden_layers=12, hidden_size=768, num_attention_heads=12, ffn_dim=3072),
+    # CPU tests of the training loop only.
+    "test": dict(num_hidden_layers=2, hidden_size=32, num_attention_heads=4, ffn_dim=64),
 }
 
 

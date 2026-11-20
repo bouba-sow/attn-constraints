@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 
 import train
 
-COMMON = ["--size", "2l", "--seed", "1", "--seq-len", "32", "--batch-seqs", "4", "--micro-batch", "2",
+COMMON = ["--size", "test", "--seed", "1", "--seq-len", "32", "--batch-seqs", "4", "--micro-batch", "2",
           "--max-steps", "6", "--eval-every", "3", "--eval-batch", "4", "--ckpt-every", "100",
           "--resume-every", "1000", "--log-every", "1", "--device", "cpu"]
 
@@ -51,12 +51,12 @@ def test_resume_is_exact(data_root, tmp_path, monkeypatch):
 
     monkeypatch.setattr(train, "StopFlag", lambda: StopAfter(3))
     assert run(args, data_root, tmp_path / "b") == train.EXIT_INTERRUPTED
-    run_b = tmp_path / "b" / "forget_2l_s1"
+    run_b = tmp_path / "b" / "forget_test_s1"
     assert (run_b / "resume.pt").exists() and not (run_b / "DONE").exists()
     monkeypatch.setattr(train, "StopFlag", lambda: StopAfter(10**9))
     assert run(args, data_root, tmp_path / "b") == 0
 
-    wa = load_file(tmp_path / "a" / "forget_2l_s1" / "final" / "model.safetensors")
+    wa = load_file(tmp_path / "a" / "forget_test_s1" / "final" / "model.safetensors")
     wb = load_file(run_b / "final" / "model.safetensors")
     assert wa.keys() == wb.keys()
     for k in wa:
@@ -70,9 +70,9 @@ def test_resume_is_exact(data_root, tmp_path, monkeypatch):
 def test_loss_decreases_and_matched_init(data_root, tmp_path):
     for attn in ("vanilla", "stickbreaking"):
         assert run(["--attn", attn, *COMMON, "--max-steps", "20", "--lr", "3e-3"], data_root, tmp_path) == 0
-        rows = (tmp_path / f"{attn}_2l_s1" / "train_log.csv").read_text().splitlines()[1:]
+        rows = (tmp_path / f"{attn}_test_s1" / "train_log.csv").read_text().splitlines()[1:]
         losses = [float(r.split(",")[2]) for r in rows]
         assert losses[-1] < losses[0] - 0.5, (attn, losses)
-    init = [load_file(tmp_path / f"{a}_2l_s1" / "checkpoints" / "step_00000" / "model.safetensors")
+    init = [load_file(tmp_path / f"{a}_test_s1" / "checkpoints" / "step_00000" / "model.safetensors")
             for a in ("vanilla", "stickbreaking")]
     assert all(torch.equal(init[0][k], init[1][k]) for k in init[0])

@@ -186,7 +186,8 @@ cache: `use_cache` is accepted and ignored. ALiBi slopes can be scaled at load t
 - Shared weights are identical across types for the same seed.
 - Save, then load in a fresh process with `trust_remote_code`, gives the same logits (all types).
 - Tokenization round trip, with `<|endoftext|>` count = document count.
-- Training on synthetic data: the loss decreases, and a killed run resumes to bit-identical weights.
+- Training on synthetic data (`--size test`, hidden 32, for CPU speed): the loss decreases, and a
+  killed run resumes to bit-identical weights.
 
 ## Stage 2 (later, same code)
 
