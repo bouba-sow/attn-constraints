@@ -56,6 +56,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--attn", required=True, choices=ATTN_TYPES)
     p.add_argument("--size", required=True, choices=tuple(SIZES))
     p.add_argument("--seed", required=True, type=int)
+    p.add_argument("--window-size", type=int, default=None,
+                   help="N for --attn window (N-gram attention); the run is named window{N}_...")
     p.add_argument("--data-root", type=Path, default=default_root("data"))
     p.add_argument("--runs-root", type=Path, default=default_root("runs"))
     p.add_argument("--run-name", default=None, help="default: {attn}_{size}_s{seed}")
@@ -89,7 +91,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--data-root and --runs-root are required when $SCRATCH is not set")
     if args.batch_seqs % args.micro_batch:
         p.error("--batch-seqs must be a multiple of --micro-batch")
-    args.run_name = args.run_name or f"{args.attn}_{args.size}_s{args.seed}"
+    if (args.attn == "window") != (args.window_size is not None):
+        p.error("--window-size is required with --attn window, and only allowed with it")
+    args.attn_label = f"window{args.window_size}" if args.attn == "window" else args.attn
+    args.run_name = args.run_name or f"{args.attn_label}_{args.size}_s{args.seed}"
     return args
 
 
@@ -269,8 +274,8 @@ def save_resume(path: Path, model, optimizer, scaler, step: int, args) -> None:
 
 
 def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
-    keys = ("attn", "size", "seed", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr", "warmup_frac",
-            "weight_decay", "beta1", "beta2", "grad_clip")
+    keys = ("attn", "window_size", "size", "seed", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr",
+            "warmup_frac", "weight_decay", "beta1", "beta2", "grad_clip")
     changed = {k: (saved.get(k), str(getattr(args, k))) for k in keys if saved.get(k) != str(getattr(args, k))}
     if changed:
         raise SystemExit(f"resume.pt was written with different settings: {changed}")
@@ -295,7 +300,9 @@ def main(argv: list[str] | None = None) -> int:
     perm = np.random.default_rng(args.seed).permutation(train.n_windows)[:needed]
 
     torch.manual_seed(args.seed)
-    config = make_config(args.attn, args.size, max_position_embeddings=args.seq_len)
+    config = make_config(
+        args.attn, args.size, max_position_embeddings=args.seq_len, window_size=args.window_size
+    )
     model = ConstrainedOPTForCausalLM(config)
     init_matched_weights(model, args.seed)
     model.to(args.device)
@@ -362,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     tracker = Tracker(
         args,
         config={
-            "attn": args.attn, "size": args.size, "seed": args.seed, "n_params": n_params,
+            "attn": args.attn_label, "size": args.size, "seed": args.seed, "n_params": n_params,
             "lr": args.lr, "batch_tokens": tokens_per_step, "max_steps": args.max_steps,
             "micro_batch": args.micro_batch, "precision": str(amp_dtype or torch.float32),
             "gpu": torch.cuda.get_device_name() if args.device.startswith("cuda") else None,

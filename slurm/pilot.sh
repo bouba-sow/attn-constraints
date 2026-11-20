@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pilot runs before the grid (README "Pilot"). Submit from the repository root.
 #
-# MODE=single (default): every attention type x size, seed 1, 190 steps (50M tokens), one at a
+# MODE=single (default): every grid attention type x size, seed 1, 190 steps (50M tokens), one at a
 #   time on one GPU: loss goes down, no NaNs, tokens/s and peak memory per configuration.
 #     sbatch slurm/pilot.sh
 # MODE=mps: the slowest configuration (forget 4l) as N = 1, 2, 4, 8 parallel processes on one
@@ -44,7 +44,7 @@ if [[ "$MODE" == "single" ]]; then
   export TRAIN_ARGS="--max-steps 190 --eval-every 1000 --eval-max-windows 1024 --ckpt-every 100000 --no-save-init --log-every 10 ${TRAIN_ARGS:-}"
   dirs=()
   for size in 2l 4l; do
-    for attn in vanilla vanilla_pos alibi forget stickbreaking; do
+    for attn in "${GRID_ATTNS[@]}"; do
       run_parallel "$root" "$attn $size 1"
       dirs+=("$root/${attn}_${size}_s1")
     done

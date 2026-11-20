@@ -27,14 +27,17 @@ class ConstrainedOPTConfig(OPTConfig):
     def __init__(
         self,
         attn_type: str = "vanilla",
-        window_size: int = 3,
+        window_size: int | None = None,
         alibi_slope_scale: float = 1.0,
         **kwargs,
     ):
         if attn_type not in ATTN_TYPES:
             raise ValueError(f"attn_type must be one of {ATTN_TYPES}, got {attn_type!r}")
+        if attn_type == "window" and not (isinstance(window_size, int) and window_size >= 1):
+            raise ValueError(f"attn_type='window' needs window_size >= 1, got {window_size!r}")
         self.attn_type = attn_type
-        # Only used by attn_type="window": keys restricted to i - n < j <= i.
+        # Only used by attn_type="window" (N-gram attention): keys restricted to i - N < j <= i,
+        # i.e. the current token and the N - 1 before it. The grid uses N = 6, 10, 14.
         self.window_size = window_size
         # Only used by attn_type="alibi": multiplies the fixed slopes. 1.0 for training;
         # set to 0.0 at evaluation time to check that a trained model relies on its bias.

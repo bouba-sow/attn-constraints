@@ -33,9 +33,10 @@ if [[ ! -x "$PY" ]]; then
 fi
 cd "$REPO_DIR"
 
-# The 50 stage-1 runs, ordered so that consecutive runs share size and seed: with
-# RUNS_PER_GPU=5, each GPU trains one matched set (all attention types for one size x seed).
-GRID_ATTNS=(vanilla vanilla_pos alibi forget stickbreaking)
+# The 80 stage-1 runs, ordered so that consecutive runs share size and seed: with
+# RUNS_PER_GPU=8 (or 4), each GPU trains one matched set (or half of one): all attention types
+# for one size x seed. windowN = N-gram attention with window N.
+GRID_ATTNS=(vanilla vanilla_pos alibi forget stickbreaking window6 window10 window14)
 GRID_SIZES=(2l 4l)
 GRID_SEEDS=(1 2 3 4 5)
 grid_runs() {
@@ -54,13 +55,18 @@ grid_runs() {
 # Usage: run_parallel <runs_root> <spec>... ; extra train.py arguments come from $TRAIN_ARGS.
 run_parallel() {
   local runs_root="$1"; shift
-  local pids=() names=() spec attn size seed name status failed=0 i
+  local pids=() names=() spec attn size seed name status failed=0 i attn_args
   for spec in "$@"; do
     read -r attn size seed <<<"$spec"
     name="${attn}_${size}_s${seed}"
+    if [[ "$attn" =~ ^window([0-9]+)$ ]]; then
+      attn_args=(--attn window --window-size "${BASH_REMATCH[1]}")
+    else
+      attn_args=(--attn "$attn")
+    fi
     mkdir -p "$runs_root/$name"
     # shellcheck disable=SC2086
-    "$PY" train.py --attn "$attn" --size "$size" --seed "$seed" --runs-root "$runs_root" \
+    "$PY" train.py "${attn_args[@]}" --size "$size" --seed "$seed" --runs-root "$runs_root" \
       --data-root "$DATA_ROOT" ${TRAIN_ARGS:-} >>"$runs_root/$name/stdout.log" 2>&1 &
     pids+=($!)
     names+=("$name")

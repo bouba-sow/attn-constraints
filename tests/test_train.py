@@ -112,3 +112,18 @@ def test_loss_decreases_and_matched_init(data_root, tmp_path):
     init = [load_file(tmp_path / f"{a}_test_s1" / "checkpoints" / "step_00000" / "model.safetensors")
             for a in ("vanilla", "stickbreaking")]
     assert all(torch.equal(init[0][k], init[1][k]) for k in init[0])
+
+
+def test_window_run_names_and_validation():
+    base = ["--size", "4l", "--seed", "2", "--data-root", "d", "--runs-root", "r"]
+    args = train.parse_args(["--attn", "window", "--window-size", "10", *base])
+    assert args.run_name == "window10_4l_s2" and args.attn_label == "window10"
+    assert train.parse_args(["--attn", "forget", *base]).run_name == "forget_4l_s2"
+    for bad in (["--attn", "window", *base], ["--attn", "alibi", "--window-size", "6", *base]):
+        with pytest.raises(SystemExit):
+            train.parse_args(bad)
+    from model.configuration import make_config
+
+    assert make_config("window", "2l", window_size=14).window_size == 14
+    with pytest.raises(ValueError):
+        make_config("window", "2l")

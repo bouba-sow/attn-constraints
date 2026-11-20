@@ -14,6 +14,7 @@ sizes and optimizer settings, but our own preprocessing and implementation.
 |---|---|---|
 | `vanilla` | none (NoPE) | matched baseline |
 | `alibi`, `forget`, `stickbreaking` | none, as originally published | constrained models |
+| `window6`, `window10`, `window14` | none | N-gram (sliding-window) attention, N = 6, 10, 14 |
 | `vanilla_pos` | learned absolute (OPT standard) | reference: a normal transformer |
 
 Constrained vs `vanilla` differs only in the attention score function. A causal transformer
@@ -29,7 +30,7 @@ With s_ij = q_i·k_j/√d_head and causal masking (j ≤ i):
 | `alibi` | softmax_j(s_ij − m_h(i − j)); fixed Press et al. slopes, m_h > 0 (H=4: 1/4…1/256; H=6: 1/4, 1/16, 1/64, 1/256, 1/2, 1/8) |
 | `forget` | softmax_j(s_ij + Σ_{j<t≤i} log f_t,h), f_t,h = σ(w_h·x_t + b_h) from the post-LayerNorm input (FoX "full"; gate init normal(0, 0.02), bias 0) |
 | `stickbreaking` | A_ij = σ(s_ij) ∏_{j<k≤i}(1 − σ(s_ik)); the current token is included, no softmax, no renormalization (rows sum to ≤ 1) |
-| `window` (pilot only) | vanilla with keys restricted to i − 3 < j ≤ i |
+| `window` + `--window-size N` (run name `windowN`) | vanilla with keys restricted to i − N < j ≤ i (the current token and the N − 1 before it) |
 
 Scores, masks, softmax and cumulative sums are computed in fp32 inside bf16 autocast as explicit
 T×T tensors: no custom kernels, so any GPU works.
@@ -60,8 +61,10 @@ weights are bit-identical across attention types (tested).
   clipping at 1.0, 1% linear warmup, then cosine decay to 0. bf16 autocast (fp16 with loss
   scaling on GPUs without bf16).
 
-**Stage 1 grid**: {vanilla, vanilla_pos, alibi, forget, stickbreaking} × {2l, 4l} × seeds 1–5 =
-50 runs, named `{attn}_{size}_s{seed}` (e.g. `forget_4l_s3`).
+**Stage 1 grid**: {vanilla, vanilla_pos, alibi, forget, stickbreaking, window6, window10, window14}
+× {2l, 4l} × seeds 1–5 = 80 runs, named `{attn}_{size}_s{seed}` (e.g. `forget_4l_s3`,
+`window10_2l_s1`). The N-gram windows are wider than Bu et al.'s N ∈ {2, 3, 5}, which were so
+restrictive that those models fit reading times very badly.
 
 ## Layout
 
@@ -118,16 +121,17 @@ MODE=mps sbatch slurm/pilot.sh    # forget 4l as 1, 2, 4, 8 processes on one GPU
 ```
 
 Pick `RUNS_PER_GPU` where total tokens/s levels off, and `--micro-batch` from peak memory.
-`RUNS_PER_GPU=5` gives each GPU one matched set (all five attention types for one size × seed).
+`RUNS_PER_GPU=8` gives each GPU one matched set (all eight attention types for one size × seed);
+`RUNS_PER_GPU=4` gives half a set (20 tasks: `--array=0-19`).
 
 **3. Grid**:
 
 ```bash
-RUNS_PER_GPU=5 sbatch --array=0-9 slurm/train_gpu.sh
+RUNS_PER_GPU=8 sbatch --array=0-9 slurm/train_gpu.sh
 # extra train.py flags for every run, e.g.:
-TRAIN_ARGS="--micro-batch 32" RUNS_PER_GPU=5 sbatch --array=0-9 slurm/train_gpu.sh
+TRAIN_ARGS="--micro-batch 32" RUNS_PER_GPU=8 sbatch --array=0-9 slurm/train_gpu.sh
 # preemptible pool (more GPUs; jobs may be killed and requeued, runs resume):
-RUNS_PER_GPU=5 sbatch --array=0-9 \
+RUNS_PER_GPU=8 sbatch --array=0-9 \
   --comment="preemption=yes;preemption_partitions_only=yes;requeue=true;gpu_mps=yes" slurm/train_gpu.sh
 ```
 

@@ -15,7 +15,7 @@ torch.set_num_threads(min(4, torch.get_num_threads()))
 from model.configuration import ATTN_TYPES, ConstrainedOPTConfig  # noqa: E402
 from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights  # noqa: E402
 
-# The five grid types plus the pilot-only window variant.
+# All attention types; the grid uses window with N = 6, 10, 14.
 ALL_TYPES = ATTN_TYPES
 
 
@@ -29,6 +29,8 @@ def tiny_config(attn_type: str, **overrides) -> ConstrainedOPTConfig:
         ffn_dim=64,
         max_position_embeddings=32,
     )
+    if attn_type == "window":
+        kw["window_size"] = 3
     kw.update(overrides)
     return ConstrainedOPTConfig(**kw)
 
