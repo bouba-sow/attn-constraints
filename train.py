@@ -224,7 +224,8 @@ class Tracker:
                 space_id=args.trackio_space,
                 config=config,
                 resume="allow" if resuming else "never",
-                private=True,
+                # Public: a free HF account cannot create private Spaces (402 Payment Required).
+                private=os.environ.get("TRACKIO_PRIVATE", "0") == "1",
             )
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: Trackio disabled ({type(exc).__name__}: {exc})", flush=True)

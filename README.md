@@ -144,7 +144,8 @@ On SIGTERM/SIGUSR1 (time limit, preemption) each run saves `resume.pt` after its
 and exits with code 99.
 
 **Live dashboard (Trackio).** Every run logs train/validation loss, learning rate, gradient
-norm and tokens/s to a private Hugging Face Space,
+norm and tokens/s to a public Hugging Face Space (set `TRACKIO_PRIVATE=1` for a private one, which
+needs a paid account),
 [`boubasow/attn-constraints-dashboard`](https://huggingface.co/spaces/boubasow/attn-constraints-dashboard).
 The Space is created on first use and needs `HF_TOKEN` with write access in the submitting shell.
 - Runs are grouped by matched set (`{size}_s{seed}`). Grid runs log to project

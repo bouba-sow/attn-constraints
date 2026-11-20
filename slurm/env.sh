@@ -15,8 +15,8 @@ export DATA_ROOT="${DATA_ROOT:-$SCRATCH/attn_constraints/data}"
 export RUNS_ROOT="${RUNS_ROOT:-$SCRATCH/attn_constraints/runs}"
 export PILOT_ROOT="${PILOT_ROOT:-$SCRATCH/attn_constraints/pilot}"
 
-# Live Trackio dashboard (private HF Space, created on first use; needs HF_TOKEN with write
-# access). Set TRACKIO_SPACE_ID="" to turn it off; TensorBoard logs are written regardless.
+# Live Trackio dashboard (public HF Space, created on first use; needs HF_TOKEN with write
+# access; TRACKIO_PRIVATE=1 for a private Space, which needs a paid account). Set TRACKIO_SPACE_ID="" to turn it off; TensorBoard logs are written regardless.
 export TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID-boubasow/attn-constraints-dashboard}"
 export TRACKIO_PROJECT="${TRACKIO_PROJECT:-attn-constraints}"
 
