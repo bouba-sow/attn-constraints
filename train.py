@@ -383,7 +383,10 @@ def train_run(args: argparse.Namespace, run_dir: Path, lock: RunLock) -> int:
     resume_path = run_dir / "resume.pt"
     start_step = 0
     if resume_path.exists():
-        state = torch.load(resume_path, map_location=args.device, weights_only=False)
+        # Load on CPU: the RNG states must stay CPU ByteTensors (map_location="cuda" moves them to
+        # the GPU and set_rng_state then fails); load_state_dict copies weights and optimizer state
+        # to the parameters' device.
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
         check_resume_args(state["args"], args)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
