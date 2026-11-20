@@ -1,4 +1,4 @@
-# Common environment for the job scripts (sourced, not run).
+# Common environment for the job scripts (sourced, not run), on NYU Torch and Jean Zay.
 # Torch login shells carry conda entries that break the venv (old libcrypto -> hashlib), so
 # scrub them before using .venv/bin/python.
 
@@ -6,9 +6,25 @@ unset LD_LIBRARY_PATH PYTHONPATH
 PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -i conda | paste -sd:)"
 export PATH
 
-export SCRATCH="${SCRATCH:-/scratch/bs5813}"
+# Cluster: Jean Zay sets IDRPROJ in every shell; anything else is treated as NYU Torch.
+if [[ -n "${IDRPROJ:-}" ]]; then
+  export CLUSTER=jeanzay
+  # SCRATCH is set by IDRIS (/lustre/fsn1/...). It is purged after 30 days without access:
+  # copy finished runs to $STORE (see slurm/jz/archive.sh). Do not write runs to $WORK
+  # (500k-inode quota).
+  : "${SCRATCH:?SCRATCH must be set on Jean Zay}"
+  # Compute nodes have no internet: everything must already be on disk.
+  if [[ "${SLURM_JOB_PARTITION:-}" != prepost && -n "${SLURM_JOB_ID:-}" ]]; then
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  fi
+  # Per-job local scratch when available, else a shared tmp on SCRATCH.
+  export TMPDIR="${JOBSCRATCH:-$SCRATCH/tmp}"
+else
+  export CLUSTER=torch
+  export SCRATCH="${SCRATCH:-/scratch/bs5813}"
+  export TMPDIR="$SCRATCH/tmp"
+fi
 export HF_HOME="${HF_HOME:-$SCRATCH/hf_cache}"
-export TMPDIR="$SCRATCH/tmp"
 mkdir -p "$TMPDIR"
 
 export DATA_ROOT="${DATA_ROOT:-$SCRATCH/attn_constraints/data}"
@@ -30,9 +46,17 @@ cd "$REPO_DIR"
 
 # The 50 stage-1 runs, ordered so that consecutive runs share size and seed: with
 # RUNS_PER_GPU=5, each GPU trains one matched set (all attention types for one size x seed).
-GRID_ATTNS=(vanilla vanilla_pos alibi forget stickbreaking)
-GRID_SIZES=(2l 4l)
-GRID_SEEDS=(1 2 3 4 5)
+# Defaults: stage 1 on Torch (2l, 4l; 5 types), stage 2 on Jean Zay (125m; 5 types plus the
+# hard N-gram window models N = 3, 4, 5). Override with space-separated strings, e.g.
+# GRID_SIZES=125m GRID_SEEDS="1 2 3" GRID_ATTNS="vanilla window3".
+if [[ "$CLUSTER" == jeanzay ]]; then
+  _attns="vanilla vanilla_pos alibi forget stickbreaking window3 window4 window5" _sizes="125m"
+else
+  _attns="vanilla vanilla_pos alibi forget stickbreaking" _sizes="2l 4l"
+fi
+read -r -a GRID_ATTNS <<<"${GRID_ATTNS:-$_attns}"
+read -r -a GRID_SIZES <<<"${GRID_SIZES:-$_sizes}"
+read -r -a GRID_SEEDS <<<"${GRID_SEEDS:-1 2 3 4 5}"
 grid_runs() {
   local size seed attn
   for size in "${GRID_SIZES[@]}"; do

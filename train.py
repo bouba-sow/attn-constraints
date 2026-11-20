@@ -25,6 +25,7 @@ import json
 import math
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -46,6 +47,44 @@ EXIT_INTERRUPTED = 99
 LOG_FIELDS = ["step", "tokens", "train_loss", "val_loss", "lr", "grad_norm", "tokens_per_s", "peak_mem_gb"]
 
 
+# Training recipes. A flag given on the command line overrides the recipe value.
+# * stage1 (2l, 4l; NYU Torch): the agreed stage-1 spec.
+# * opt (125m; Jean Zay): OPT-125M as published (Zhang et al. 2022, Sec. 2.2 and Table 1;
+#   metaseq opt_job_constants.py / opt_baselines.py): context 2048, 0.5M-token batches
+#   (256 x 2048), peak lr 6e-4, linear warmup over 375M tokens (715 steps), linear decay to 10%
+#   of the peak, AdamW (0.9, 0.95), eps 1e-8, weight decay 0.1, clip 1.0, init std 0.006 with
+#   output projections scaled by 1/sqrt(2L), tied input/output embeddings. Our budget: 9,540
+#   steps x 524,288 = 5.0B tokens (OPT decays over 300B), a checkpoint every 954 steps
+#   (~500M tokens). Kept from the suite spec, not OPT: dropout 0 (OPT: 0.1) and no position
+#   embeddings except for vanilla_pos. Implementation: torch.compile (same math, fused; on an
+#   H100 at 2048 tokens: ~130k tok/s vanilla/ALiBi, ~118k forget, ~95k stick-breaking, vs
+#   25-53k eager) and micro-batch 4 for every type (stick-breaking needs ~32 GB at 4).
+RECIPES = {
+    "stage1": dict(seq_len=1024, batch_seqs=256, max_steps=7630, lr=1e-3, min_lr=0.0,
+                   schedule="cosine", warmup_frac=0.01, warmup_steps=None, adam_eps=1e-8,
+                   init_std=0.02, init_output_scale=False, tie_embeddings=False, ckpt_every=1000,
+                   micro_batch=16, compile=False),
+    "opt": dict(seq_len=2048, batch_seqs=256, max_steps=9540, lr=6e-4, min_lr=6e-5,
+                schedule="linear", warmup_frac=None, warmup_steps=715, adam_eps=1e-8,
+                init_std=0.006, init_output_scale=True, tie_embeddings=True, ckpt_every=954,
+                micro_batch=4, compile=True),
+}
+DEFAULT_RECIPE = {"2l": "stage1", "4l": "stage1", "125m": "opt"}
+
+
+def parse_attn(attn: str, parser: argparse.ArgumentParser | None = None) -> tuple[str, int | None]:
+    """'forget' -> ('forget', None); 'window4' -> ('window', 4); plain 'window' keeps the config default (3)."""
+    if attn in ATTN_TYPES:
+        return attn, None
+    m = re.fullmatch(r"window([1-9][0-9]*)", attn)
+    if m is None:
+        msg = f"--attn must be one of {ATTN_TYPES} or windowN, got {attn!r}"
+        if parser is not None:
+            parser.error(msg)
+        raise ValueError(msg)
+    return "window", int(m.group(1))
+
+
 def default_root(name: str) -> Path | None:
     scratch = os.environ.get("SCRATCH")
     return Path(scratch) / "attn_constraints" / name if scratch else None
@@ -53,19 +92,30 @@ def default_root(name: str) -> Path | None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--attn", required=True, choices=ATTN_TYPES)
+    p.add_argument("--attn", required=True, metavar="ATTN",
+                   help=f"one of {ATTN_TYPES}, or windowN (window attention over the last N tokens, "
+                        "current one included: the hard N-gram models, e.g. window3)")
     p.add_argument("--size", required=True, choices=tuple(SIZES))
     p.add_argument("--seed", required=True, type=int)
     p.add_argument("--data-root", type=Path, default=default_root("data"))
     p.add_argument("--runs-root", type=Path, default=default_root("runs"))
     p.add_argument("--run-name", default=None, help="default: {attn}_{size}_s{seed}")
-    p.add_argument("--seq-len", type=int, default=1024)
-    p.add_argument("--batch-seqs", type=int, default=256, help="sequences per optimizer step")
-    p.add_argument("--micro-batch", type=int, default=16, help="sequences per forward pass")
-    p.add_argument("--max-steps", type=int, default=7630, help="7630 x 256 x 1024 = 2.0B tokens")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--min-lr", type=float, default=0.0)
-    p.add_argument("--warmup-frac", type=float, default=0.01)
+    p.add_argument("--recipe", choices=tuple(RECIPES), default=None,
+                   help="default: stage1 for 2l/4l, opt for 125m (see RECIPES)")
+    # Recipe-controlled settings: None = take the recipe value.
+    p.add_argument("--seq-len", type=int, default=None)
+    p.add_argument("--batch-seqs", type=int, default=None, help="sequences per optimizer step")
+    p.add_argument("--micro-batch", type=int, default=None, help="sequences per forward pass")
+    p.add_argument("--max-steps", type=int, default=None, help="stage1: 7630 x 256 x 1024 = 2.0B tokens")
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--min-lr", type=float, default=None)
+    p.add_argument("--schedule", choices=("cosine", "linear"), default=None, help="decay after warmup")
+    p.add_argument("--warmup-frac", type=float, default=None)
+    p.add_argument("--warmup-steps", type=int, default=None, help="overrides --warmup-frac")
+    p.add_argument("--adam-eps", type=float, default=None)
+    p.add_argument("--init-std", type=float, default=None)
+    p.add_argument("--init-output-scale", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--tie-embeddings", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
@@ -73,14 +123,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-batch", type=int, default=32)
     p.add_argument("--eval-max-windows", type=int, default=None, help="cap validation (pilot only)")
-    p.add_argument("--ckpt-every", type=int, default=1000)
+    p.add_argument("--ckpt-every", type=int, default=None)
     p.add_argument("--no-save-init", action="store_true", help="skip checkpoints/step_00000")
     p.add_argument("--resume-every", type=int, default=100)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
-    p.add_argument("--compile", action="store_true", help="torch.compile the model")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None, help="torch.compile the model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args(argv)
+    args.attn_type, args.window_size = parse_attn(args.attn, p)
+    args.recipe = args.recipe or DEFAULT_RECIPE[args.size]
+    for key, value in RECIPES[args.recipe].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    if args.warmup_steps is None and args.warmup_frac is None:
+        p.error("set --warmup-steps or --warmup-frac")
     if args.data_root is None or args.runs_root is None:
         p.error("--data-root and --runs-root are required when $SCRATCH is not set")
     if args.batch_seqs % args.micro_batch:
@@ -103,12 +160,20 @@ class TokenWindows:
         return torch.from_numpy(batch)
 
 
+def warmup_steps(args: argparse.Namespace) -> int:
+    if args.warmup_steps is not None:
+        return max(1, args.warmup_steps)
+    return max(1, math.ceil(args.warmup_frac * args.max_steps))
+
+
 def lr_at(step: int, args: argparse.Namespace) -> float:
-    """Linear warmup over the first warmup_frac of steps, then cosine decay to min_lr."""
-    warmup = max(1, math.ceil(args.warmup_frac * args.max_steps))
+    """Linear warmup to lr, then cosine or linear decay to min_lr at max_steps."""
+    warmup = warmup_steps(args)
     if step < warmup:
         return args.lr * (step + 1) / warmup
     progress = (step - warmup) / max(1, args.max_steps - warmup)
+    if args.schedule == "linear":
+        return args.lr - (args.lr - args.min_lr) * progress
     return args.min_lr + (args.lr - args.min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -123,7 +188,7 @@ def make_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.op
         {"params": no_decay, "weight_decay": 0.0},
     ]
     fused = args.device.startswith("cuda")
-    return torch.optim.AdamW(groups, lr=args.lr, betas=(args.beta1, args.beta2), fused=fused)
+    return torch.optim.AdamW(groups, lr=args.lr, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=fused)
 
 
 def resolve_precision(args: argparse.Namespace) -> torch.dtype | None:
@@ -220,7 +285,8 @@ def save_resume(path: Path, model, optimizer, scaler, step: int, args) -> None:
 
 
 def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
-    keys = ("attn", "size", "seed", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr", "warmup_frac",
+    keys = ("attn", "size", "seed", "recipe", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr", "schedule",
+            "warmup_frac", "warmup_steps", "adam_eps", "init_std", "init_output_scale", "tie_embeddings",
             "weight_decay", "beta1", "beta2", "grad_clip")
     changed = {k: (saved.get(k), str(getattr(args, k))) for k in keys if saved.get(k) != str(getattr(args, k))}
     if changed:
@@ -246,7 +312,16 @@ def main(argv: list[str] | None = None) -> int:
     perm = np.random.default_rng(args.seed).permutation(train.n_windows)[:needed]
 
     torch.manual_seed(args.seed)
-    config = make_config(args.attn, args.size, max_position_embeddings=args.seq_len)
+    window_kw = {} if args.window_size is None else {"window_size": args.window_size}
+    config = make_config(
+        args.attn_type,
+        args.size,
+        **window_kw,
+        max_position_embeddings=args.seq_len,
+        init_std=args.init_std,
+        init_output_scale=args.init_output_scale,
+        tie_word_embeddings=args.tie_embeddings,
+    )
     model = ConstrainedOPTForCausalLM(config)
     init_matched_weights(model, args.seed)
     model.to(args.device)
@@ -258,18 +333,23 @@ def main(argv: list[str] | None = None) -> int:
     resume_path = run_dir / "resume.pt"
     start_step = 0
     if resume_path.exists():
-        state = torch.load(resume_path, map_location=args.device, weights_only=False)
+        # Load on the CPU: torch.set_rng_state / cuda.set_rng_state_all only accept CPU ByteTensors
+        # (map_location="cuda" made every GPU resume crash). load_state_dict copies the model
+        # weights to their device, and the optimizer moves its state to each parameter's device.
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
         check_resume_args(state["args"], args)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scaler.load_state_dict(state["scaler"])
-        torch.set_rng_state(state["rng_cpu"])
+        torch.set_rng_state(state["rng_cpu"].cpu())
         if state["rng_cuda"] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["rng_cuda"])
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["rng_cuda"]])
         start_step = state["step"]
         print(f"{args.run_name}: resuming at step {start_step}", flush=True)
 
-    n_params = sum(p.numel() for p in model.parameters())
+    if args.tie_embeddings and model.lm_head.weight is not model.model.decoder.embed_tokens.weight:
+        raise SystemExit("tie_embeddings is set but lm_head is not tied to embed_tokens")
+    n_params = sum(p.numel() for p in model.parameters())  # shared tensors counted once
     n_embed = sum(p.numel() for n, p in model.named_parameters() if "embed_" in n or n.startswith("lm_head"))
     tokens_per_step = args.batch_seqs * args.seq_len
     write_json_atomic(

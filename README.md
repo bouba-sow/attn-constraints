@@ -29,7 +29,7 @@ With s_ij = q_i·k_j/√d_head and causal masking (j ≤ i):
 | `alibi` | softmax_j(s_ij − m_h(i − j)); fixed Press et al. slopes, m_h > 0 (H=4: 1/4…1/256; H=6: 1/4, 1/16, 1/64, 1/256, 1/2, 1/8) |
 | `forget` | softmax_j(s_ij + Σ_{j<t≤i} log f_t,h), f_t,h = σ(w_h·x_t + b_h) from the post-LayerNorm input (FoX "full"; gate init normal(0, 0.02), bias 0) |
 | `stickbreaking` | A_ij = σ(s_ij) ∏_{j<k≤i}(1 − σ(s_ik)); the current token is included, no softmax, no renormalization (rows sum to ≤ 1) |
-| `window` (pilot only) | vanilla with keys restricted to i − 3 < j ≤ i |
+| `windowN` (stage 2: N = 3, 4, 5; plain `window` = 3) | vanilla with keys restricted to i − N < j ≤ i: the hard N-gram models (N tokens visible per layer, current one included; Bu et al.'s `window_size` convention). Over L layers the receptive field is L(N − 1) + 1 tokens: 25 / 37 / 49 at 12 layers |
 
 Scores, masks, softmax and cumulative sums are computed in fp32 inside bf16 autocast as explicit
 T×T tensors: no custom kernels, so any GPU works.
@@ -41,7 +41,7 @@ pre-LayerNorm, ReLU, dropout 0, init std 0.02, biases 0):
 |---|---|---|
 | `2l` | 2 / 256 / 4 / 1024 | ≈27.3M (+0.26M for `vanilla_pos`) |
 | `4l` | 4 / 384 / 6 / 1536 | ≈45.7M (+0.39M for `vanilla_pos`) |
-| `125m` (stage 2) | 12 / 768 / 12 / 3072 | ≈162M with untied embeddings |
+| `125m` (stage 2) | 12 / 768 / 12 / 3072 | ≈125M (tied embeddings, OPT recipe; see "Jean Zay") |
 
 **Matched initialization.** `init_matched_weights` draws every shared parameter from a generator
 seeded with `seed`, in module order, and the constraint-only parameters (forget-gate projection,
@@ -78,6 +78,10 @@ slurm/env.sh              environment, grid definition, parallel launcher (sourc
 slurm/data_cpu.sh         download + tokenize (CPU job)
 slurm/pilot.sh            pilot: per-configuration check, MPS scaling
 slurm/train_gpu.sh        one GPU per array task, RUNS_PER_GPU runs under MPS
+slurm/jz/                 Jean Zay (stage 2): check_125m, tokenize (CPU dev), pilot, train, archive
+tools/check_benchmark_load.py  checkpoint check with the benchmark's loader (benchmark venv)
+tools/trackio.sh          trackio dashboard from train_log.csv (login node)
+tools/wandb.sh            W&B sync from train_log.csv (login node)
 tests/                    attention, I/O and training tests (CPU)
 ```
 
@@ -153,6 +157,104 @@ rsync -avP --partial --include='*/' --include='final/***' --include='checkpoints
   $RUNS_ROOT/ jeanzay:<dest>/attn_constraints_runs/
 ```
 
+## Jean Zay (stage 2: 125m, OPT-125M recipe)
+
+Stage 1 (2l, 4l) runs on Torch; stage 2 (125m) runs on Jean Zay with the same code and
+environment (`uv.lock`). The two stages are not compared with each other, so each cluster
+downloads and tokenizes its own data; all runs of a size train on one cluster from one `train.bin`.
+`slurm/env.sh` detects Jean Zay (`IDRPROJ` is set), and the job scripts in `slurm/jz/` carry the
+Jean Zay headers (accounts `ldh@h100` / `ldh@cpu`) before running the shared bodies in `slurm/`.
+
+**Recipe** (`train.py` `RECIPES["opt"]`, the default for `--size 125m`; any flag overrides it).
+OPT-125M as published (Zhang et al. 2022, Sec. 2.2 and Table 1; metaseq
+`opt_job_constants.py` / `opt_baselines.py`):
+
+| | OPT-125M | here |
+|---|---|---|
+| layers / hidden / heads / FFN | 12 / 768 / 12 / 3072 | same |
+| context | 2048 | same |
+| batch | 0.5M tokens | 256 x 2048 = 524,288 |
+| optimizer | AdamW (0.9, 0.95), eps 1e-8, weight decay 0.1 | same (decay on 2-D weights, not embeddings) |
+| peak lr, schedule | 6e-4; linear warmup over 375M tokens, linear decay to 10% | same: 715 warmup steps, decay to 6e-5 at the last step |
+| gradient clipping | 1.0 | same |
+| init | normal(0, 0.006), output layers / sqrt(2L), biases 0 | same (`self_attn.out_proj`, `fc2`) |
+| embeddings | tied | tied (`tie_word_embeddings`): ~125M parameters |
+| training length | 300B tokens | 9,540 steps = 5.0B tokens; schedule spans our 5B |
+| dropout | 0.1 (not on embeddings) | **0** (single pass; suite spec) |
+| position embeddings | learned | **none**, except `vanilla_pos` (study design) |
+| tokenizer | GPT-2 | Pythia / GPT-NeoX (suite spec) |
+
+Checkpoints: step 0, then every 954 steps (~500M tokens; 10 checkpoints, the last = final).
+
+**Grid**: {vanilla, vanilla_pos, alibi, forget, stickbreaking, window3, window4, window5} x seeds
+1-5 = 40 runs (`slurm/env.sh` Jean Zay defaults), named e.g. `window4_125m_s2`. Bu et al. used
+N = 2, 3, 5 at 2 layers (receptive field 3 / 5 / 9 tokens); here N = 3, 4, 5 at 12 layers.
+
+**Cluster notes.**
+- No MPS: one run per H100, one array task per run; the pilot has only the per-configuration mode.
+- Time limit 20 h (`qos_gpu_h100-t3`). At the limit, runs save `resume.pt` (SIGUSR1, 10 min
+  before); resubmit the same command and they resume. Resume refuses if any recipe setting changed.
+- Compute nodes have no internet: data is downloaded on a login node and tokenized on a CPU node (dev QoS, 8 cores); GPU jobs run
+  with `HF_HUB_OFFLINE=1`.
+- Data and runs go to `$SCRATCH/attn_constraints/`. `$SCRATCH` is purged after 30 days without
+  access: copy runs to `$STORE` with `slurm/jz/archive.sh`. Never write runs to `$WORK` (inode quota).
+
+```bash
+cd $WORK/attn-constraints
+export TMPDIR=$SCRATCH/tmp UV_CACHE_DIR=$SCRATCH/.cache/uv UV_LINK_MODE=copy
+uv sync --frozen                                     # login node (has internet)
+srun -A ldh@cpu --qos=qos_cpu-dev -c 8 --hint=nomultithread -t 00:45:00 .venv/bin/python -m pytest -q
+
+sbatch slurm/jz/check_125m.sh                        # 0. pre-flight on synthetic tokens: must PASS
+DATA_ROOT=$SCRATCH/attn_constraints/data bash data/download.sh   # 1a. download (login node)
+sbatch slurm/jz/tokenize_cpu.sh                      # 1b. tokenize (dev QoS, 8 cores, ~35 min): 5.1B tokens
+sbatch slurm/jz/pilot.sh                             # 2. pilot on real data
+sbatch --array=0-39 slurm/jz/train_gpu.sh            # 3. grid: 8 types x 5 seeds (tasks 0-7 = seed 1, ...)
+sbatch slurm/jz/archive.sh                           # 4. copy runs and data to $STORE
+```
+
+`check_125m.sh` trains every grid type at 125m for 20 steps (memory, speed, checkpoints), then
+`tools/check_benchmark_load.py` loads each checkpoint with the benchmark's own loader and checks
+tied weights, identical logits, surprisal against a hand computation, inputs longer than 2048
+tokens and the benchmark's sliding-window length. `TRAIN_ARGS` adds train.py flags to the
+pilot and grid jobs, e.g. `TRAIN_ARGS="--micro-batch 8"`.
+
+## Monitoring (W&B or trackio, Jean Zay login node)
+
+Training never talks to a tracker (compute nodes have no internet). Both tools below read the
+runs' `train_log.csv` from a login node, run from pinned, cached `uv run --with` environments
+(training venv and `uv.lock` untouched), and can be used side by side.
+
+**W&B** (`tools/wandb.sh`, wandb 0.31.1; API key in `~/.netrc`, `machine api.wandb.ai`, mode 600):
+
+```bash
+tools/wandb.sh                         # push new rows of every run to <entity>/attn-constraints-125m
+tools/wandb.sh --watch 600             # ... every 10 min (leave it in tmux/screen)
+```
+
+One W&B run per training run (id = run name, grouped by attention type, tagged with seed and
+size, config from `run_config.json`). `<run_dir>/.wandb_sync.json` records the last step pushed,
+so each sync only appends. If a crash made a run redo steps after its last resume point, the
+W&B run is replaced by `{run}-v2` with the whole CSV.
+
+**trackio** (local, no account):
+
+Training does not use trackio; `tools/trackio.sh` copies every run's `train_log.csv` (and its
+attention type, size, seed and recipe from `run_config.json`) into one local trackio project and
+serves the dashboard. trackio 0.45.1 runs from a cached `uv run --with` environment, so the
+training venv and `uv.lock` are unchanged. Run it on a login node:
+
+```bash
+tools/trackio.sh import                 # (re)build the project from $SCRATCH/attn_constraints/runs
+tools/trackio.sh import --watch 600     # refresh every 10 min (leave it in tmux/screen)
+tools/trackio.sh show                   # dashboard on 127.0.0.1:7860 of this login node
+# from your machine: ssh -N -L 7860:localhost:7860 <you>@jean-zayN.idris.fr  (the same login node)
+```
+
+Each import deletes and re-logs every run, so repeating it is safe and follows resumed runs.
+The project lives in `trackio/` (gitignored, on `$WORK`), with SQLite's rollback journal
+instead of WAL so `import` and `show` may run on different login nodes.
+
 ## Run directory
 
 ```
@@ -188,8 +290,7 @@ cache: `use_cache` is accepted and ignored. ALiBi slopes can be scaled at load t
 - Tokenization round trip, with `<|endoftext|>` count = document count.
 - Training on synthetic data: the loss decreases, and a killed run resumes to bit-identical weights.
 
-## Stage 2 (later, same code)
+## Stage 2 (same code)
 
-`--size 125m` (12 layers, hidden 768, 12 heads, FFN 3072), about 5B tokens (`--max-steps`
-≈ 19,000; still within shard 00, so re-tokenize with a larger `--max-tokens`), checkpoints
-every ~500M tokens (`--ckpt-every 2000`), only for the constraints that show an effect in stage 1.
+`--size 125m` uses the OPT-125M recipe (see "Jean Zay"): context 2048, 5.0B tokens,
+checkpoints every ~500M tokens. It runs on Jean Zay in parallel with stage 1.

@@ -253,6 +253,9 @@ class ConstrainedOPTModel(ConstrainedOPTPreTrainedModel):
 
 
 class ConstrainedOPTForCausalLM(ConstrainedOPTPreTrainedModel):
+    # Same as HF OPT: lm_head shares the input embedding when config.tie_word_embeddings is True.
+    _tied_weights_keys = {"lm_head.weight": "model.decoder.embed_tokens.weight"}
+
     def __init__(self, config: ConstrainedOPTConfig):
         super().__init__(config)
         self.model = ConstrainedOPTModel(config)
@@ -297,16 +300,29 @@ def is_constraint_param(name: str) -> bool:
     return any(key in name for key in CONSTRAINT_PARAM_KEYS)
 
 
+OUTPUT_PROJ_SUFFIXES = ("self_attn.out_proj.weight", "fc2.weight")
+
+
+def init_std_for(name: str, config: ConstrainedOPTConfig) -> float:
+    """init_std, divided by sqrt(2L) for residual output projections when init_output_scale."""
+    if config.init_output_scale and name.endswith(OUTPUT_PROJ_SUFFIXES):
+        return config.init_std / math.sqrt(2 * config.num_hidden_layers)
+    return config.init_std
+
+
 @torch.no_grad()
 def init_matched_weights(model: ConstrainedOPTForCausalLM, seed: int) -> None:
     """Deterministic init: normal(0, init_std) weights, zero biases, unit LayerNorm.
+
+    With ``config.init_output_scale`` the residual output projections use init_std / sqrt(2L)
+    (OPT / Megatron-LM). With tied embeddings, ``lm_head.weight`` is the input embedding and is
+    initialized once (``named_parameters`` yields shared tensors once).
 
     Shared parameters draw from a CPU generator seeded with ``seed``, in module order;
     constraint-only parameters (``CONSTRAINT_PARAM_KEYS``) draw from a second generator
     seeded with ``seed + 1000``. Shared weights are therefore bit-identical across attention
     types for the same seed, whatever device the model ends up on.
     """
-    std = model.config.init_std
     shared = torch.Generator().manual_seed(seed)
     extra = torch.Generator().manual_seed(seed + 1000)
     for name, param in model.named_parameters():
@@ -316,5 +332,6 @@ def init_matched_weights(model: ConstrainedOPTForCausalLM, seed: int) -> None:
             param.fill_(1.0)
         else:
             gen = extra if is_constraint_param(name) else shared
+            std = init_std_for(name, model.config)
             values = torch.empty(param.shape, dtype=torch.float32).normal_(0.0, std, generator=gen)
             param.copy_(values)

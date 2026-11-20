@@ -27,6 +27,7 @@ class ConstrainedOPTConfig(OPTConfig):
         attn_type: str = "vanilla",
         window_size: int = 3,
         alibi_slope_scale: float = 1.0,
+        init_output_scale: bool = False,
         **kwargs,
     ):
         if attn_type not in ATTN_TYPES:
@@ -37,6 +38,9 @@ class ConstrainedOPTConfig(OPTConfig):
         # Only used by attn_type="alibi": multiplies the fixed slopes. 1.0 for training;
         # set to 0.0 at evaluation time to check that a trained model relies on its bias.
         self.alibi_slope_scale = alibi_slope_scale
+        # OPT / Megatron-LM init: the residual-branch output projections (self_attn.out_proj,
+        # fc2) use init_std / sqrt(2 * num_hidden_layers). Off for stage 1, on for the OPT recipe.
+        self.init_output_scale = init_output_scale
         kwargs.setdefault("vocab_size", 50304)
         kwargs.setdefault("max_position_embeddings", 1024)
         kwargs.setdefault("do_layer_norm_before", True)

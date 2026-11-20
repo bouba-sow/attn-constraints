@@ -10,7 +10,7 @@ sys.path.insert(0, str(REPO_DIR))
 from model.configuration import ATTN_TYPES, ConstrainedOPTConfig  # noqa: E402
 from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights  # noqa: E402
 
-# The five grid types plus the pilot-only window variant.
+# The five stage-1 grid types plus window (the hard N-gram models; window3-5 in the stage-2 grid).
 ALL_TYPES = ATTN_TYPES
 
 
