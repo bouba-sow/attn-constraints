@@ -312,3 +312,16 @@ def test_window_trains_with_opt_recipe(data_root, tmp_path):
     cfg = json.loads((d / "final" / "config.json").read_text())
     assert (cfg["attn_type"], cfg["window_size"], cfg["tie_word_embeddings"]) == ("window", 4, True)
     assert json.loads((d / "run_config.json").read_text())["args"]["window_size"] == 4
+
+
+def test_window_cli_forms_agree():
+    """Torch's launcher passes '--attn window --window-size N', the Jean Zay grid '--attn windowN'."""
+    base = ["--size", "2l", "--seed", "3", "--data-root", "d", "--runs-root", "r"]
+    a = train.parse_args(["--attn", "window", "--window-size", "6", *base])
+    b = train.parse_args(["--attn", "window6", *base])
+    for x in (a, b):
+        assert (x.attn_type, x.window_size, x.attn_label, x.run_name) == ("window", 6, "window6", "window6_2l_s3")
+    with pytest.raises(SystemExit):
+        train.parse_args(["--attn", "window", *base])  # N missing
+    with pytest.raises(SystemExit):
+        train.parse_args(["--attn", "forget", "--window-size", "6", *base])

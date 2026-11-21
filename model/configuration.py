@@ -16,6 +16,8 @@ SIZES = {
     "2l": dict(num_hidden_layers=2, hidden_size=256, num_attention_heads=4, ffn_dim=1024),
     "4l": dict(num_hidden_layers=4, hidden_size=384, num_attention_heads=6, ffn_dim=1536),
     "125m": dict(num_hidden_layers=12, hidden_size=768, num_attention_heads=12, ffn_dim=3072),
+    # CPU tests of the training loop only.
+    "test": dict(num_hidden_layers=2, hidden_size=32, num_attention_heads=4, ffn_dim=64),
 }
 
 
@@ -25,7 +27,7 @@ class ConstrainedOPTConfig(OPTConfig):
     def __init__(
         self,
         attn_type: str = "vanilla",
-        window_size: int = 3,
+        window_size: int | None = None,
         alibi_slope_scale: float = 1.0,
         init_output_scale: bool = False,
         noisy_lambda: float = 0.0,
@@ -39,8 +41,11 @@ class ConstrainedOPTConfig(OPTConfig):
     ):
         if attn_type not in ATTN_TYPES:
             raise ValueError(f"attn_type must be one of {ATTN_TYPES}, got {attn_type!r}")
+        if attn_type == "window" and not (isinstance(window_size, int) and window_size >= 1):
+            raise ValueError(f"attn_type='window' needs window_size >= 1, got {window_size!r}")
         self.attn_type = attn_type
-        # Only used by attn_type="window": keys restricted to i - n < j <= i.
+        # Only used by attn_type="window" (N-gram attention): keys restricted to i - N < j <= i,
+        # i.e. the current token and the N - 1 before it. The grid uses N = 6, 10, 14.
         self.window_size = window_size
         # Only used by attn_type="alibi": multiplies the fixed slopes. 1.0 for training;
         # set to 0.0 at evaluation time to check that a trained model relies on its bias.

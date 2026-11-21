@@ -45,6 +45,7 @@ from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights, nois
 
 REPO_DIR = Path(__file__).resolve().parent
 EXIT_INTERRUPTED = 99
+EXIT_LOCKED = 98  # another process holds the run's RUNNING lock
 LOG_FIELDS = ["step", "tokens", "train_loss", "val_loss", "lr", "grad_norm", "tokens_per_s", "peak_mem_gb"]
 
 
@@ -70,7 +71,7 @@ RECIPES = {
                 init_std=0.006, init_output_scale=True, tie_embeddings=True, ckpt_every=954,
                 micro_batch=4, compile=True),
 }
-DEFAULT_RECIPE = {"2l": "stage1", "4l": "stage1", "125m": "opt"}
+DEFAULT_RECIPE = {"2l": "stage1", "4l": "stage1", "125m": "opt", "test": "stage1"}
 
 
 NOISY_SPEC = re.compile(r"noisy_l((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)")
@@ -116,6 +117,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "e.g. noisy_l0.01)")
     p.add_argument("--size", required=True, choices=tuple(SIZES))
     p.add_argument("--seed", required=True, type=int)
+    p.add_argument("--window-size", type=int, default=None,
+                   help="N for --attn window (N-gram attention); the run is named window{N}_...")
     p.add_argument("--data-root", type=Path, default=default_root("data"))
     p.add_argument("--runs-root", type=Path, default=default_root("runs"))
     p.add_argument("--run-name", default=None, help="default: {attn}_{size}_s{seed}")
@@ -140,7 +143,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=500)
-    p.add_argument("--eval-batch", type=int, default=32)
+    p.add_argument("--eval-batch", type=int, default=8)
     p.add_argument("--eval-max-windows", type=int, default=None, help="cap validation (pilot only)")
     p.add_argument("--ckpt-every", type=int, default=None)
     p.add_argument("--no-save-init", action="store_true", help="skip checkpoints/step_00000")
@@ -154,8 +157,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "et al.; 0 = noise off). The final evaluation always reports noise off and K = 16.")
     p.add_argument("--noise-final-windows", type=int, default=512,
                    help="noisy only: validation windows for the final K = 16 evaluation (16 passes each)")
+    p.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT") or None,
+                   help="wandb project for the live dashboard (default: $WANDB_PROJECT; "
+                        "unset = no wandb, TensorBoard only)")
+    p.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY") or None)
     args = p.parse_args(argv)
-    args.attn_type, args.window_size, args.noisy_lambda = parse_attn_spec(args.attn, p)
+    # Window models: '--attn window6' (Jean Zay grid) or '--attn window --window-size 6' (Torch launcher).
+    args.attn_type, spec_window, args.noisy_lambda = parse_attn_spec(args.attn, p)
+    if args.window_size is not None:
+        if args.attn != "window":
+            p.error("--window-size is only allowed with --attn window (or use --attn windowN)")
+    else:
+        args.window_size = spec_window
+    if args.attn_type == "window" and args.window_size is None:
+        p.error("window attention needs N: --attn windowN or --attn window --window-size N")
     args.recipe = args.recipe or DEFAULT_RECIPE[args.size]
     for key, value in RECIPES[args.recipe].items():
         if getattr(args, key) is None:
@@ -166,7 +181,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--data-root and --runs-root are required when $SCRATCH is not set")
     if args.batch_seqs % args.micro_batch:
         p.error("--batch-seqs must be a multiple of --micro-batch")
-    args.run_name = args.run_name or f"{args.attn}_{args.size}_s{args.seed}"
+    args.attn_label = f"window{args.window_size}" if args.attn_type == "window" else args.attn
+    args.run_name = args.run_name or f"{args.attn_label}_{args.size}_s{args.seed}"
     return args
 
 
@@ -255,6 +271,10 @@ def evaluate(model, val: TokenWindows, args, amp_dtype, max_windows: int | None 
         total += lm_loss(model, batch, amp_dtype).item() * len(idx)
         count += len(idx)
     model.train()
+    if torch.cuda.is_available():
+        # Several runs share one GPU under MPS: hand the evaluation's cached blocks back so a
+        # neighbour evaluating at the same moment does not run out of memory.
+        torch.cuda.empty_cache()
     return total / count
 
 
@@ -320,6 +340,54 @@ class CsvLog:
             csv.DictWriter(fh, fieldnames=LOG_FIELDS).writerow({k: row.get(k, "") for k in LOG_FIELDS})
 
 
+class Tracker:
+    """Optional live dashboard (Weights & Biases).
+
+    The wandb run id is derived from the run directory, so a restarted (resumed) run continues
+    the same wandb run. Logging must never stop training: any wandb error disables it for the
+    rest of the run and leaves train_log.csv and TensorBoard as the record.
+    """
+
+    def __init__(self, args: argparse.Namespace, config: dict, run_dir: Path):
+        self.run = None
+        if not args.wandb_project:
+            return
+        try:
+            import wandb
+
+            run_id = f"{args.run_name}-{hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:8]}"
+            self.run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.run_name,
+                group=f"{args.size}_s{args.seed}",  # one matched set per group
+                job_type=args.attn_label,
+                id=run_id,
+                resume="allow",
+                config=config,
+                dir=str(run_dir),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: wandb disabled ({type(exc).__name__}: {exc})", flush=True)
+
+    def log(self, metrics: dict, step: int) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.log(metrics, step=step)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: wandb disabled ({type(exc).__name__}: {exc})", flush=True)
+            self.run = None
+
+    def finish(self) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.finish()
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: wandb finish failed ({type(exc).__name__}: {exc})", flush=True)
+
+
 class StopFlag:
     def __init__(self):
         self.stop = False
@@ -347,14 +415,66 @@ def save_resume(path: Path, model, optimizer, scaler, step: int, args) -> None:
 
 
 def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
-    keys = ("attn", "size", "seed", "recipe", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr", "schedule",
-            "warmup_frac", "warmup_steps", "adam_eps", "init_std", "init_output_scale", "tie_embeddings",
+    keys = ("attn", "window_size", "size", "seed", "recipe", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr",
+            "schedule", "warmup_frac", "warmup_steps", "adam_eps", "init_std", "init_output_scale", "tie_embeddings",
             "weight_decay", "beta1", "beta2", "grad_clip")
     if args.attn_type == "noisy":
         keys = (*keys, "noisy_lambda")
-    changed = {k: (saved.get(k), str(getattr(args, k))) for k in keys if saved.get(k) != str(getattr(args, k))}
+    # Keys absent from an older resume.pt (written before a setting existed, e.g. stage-1 runs
+    # started before the recipes were merged) are not compared; every key it has must match.
+    changed = {k: (saved[k], str(getattr(args, k))) for k in keys if k in saved and saved[k] != str(getattr(args, k))}
     if changed:
         raise SystemExit(f"resume.pt was written with different settings: {changed}")
+
+
+class RunLock:
+    """``RUNNING`` file in the run directory, so one run never trains in two processes at once
+    (e.g. a crashed run relaunched elsewhere while its original job is still alive).
+
+    Created with O_EXCL (atomic on the shared filesystem) and refreshed by ``heartbeat()``; a
+    lock whose heartbeat is older than ``stale_after`` seconds belongs to a process that was
+    killed without cleaning up, and is taken over.
+    """
+
+    def __init__(self, run_dir: Path, stale_after: float = 900.0):
+        self.path = run_dir / "RUNNING"
+        self.stale_after = stale_after
+        self.held = False
+
+    def acquire(self) -> bool:
+        owner = f"host={platform.node()} pid={os.getpid()} job={os.environ.get('SLURM_JOB_ID')}\n"
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < self.stale_after:
+                    holder = self.path.read_text().strip() if self.path.exists() else "?"
+                    print(f"locked by another process ({holder}, heartbeat {age:.0f}s ago)", flush=True)
+                    return False
+                print(f"taking over a stale lock (heartbeat {age:.0f}s ago)", flush=True)
+                self.path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(fd, "w") as fh:
+                fh.write(owner)
+            self.held = True
+            return True
+        return False
+
+    def heartbeat(self) -> None:
+        if self.held:
+            try:
+                os.utime(self.path)
+            except FileNotFoundError:
+                pass
+
+    def release(self) -> None:
+        if self.held:
+            self.path.unlink(missing_ok=True)
+            self.held = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,6 +484,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.run_name}: already done", flush=True)
         return 0
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    lock = RunLock(run_dir)
+    if not lock.acquire():
+        print(f"{args.run_name}: skipped, another process is training it", flush=True)
+        return EXIT_LOCKED
+    try:
+        return train_run(args, run_dir, lock)
+    finally:
+        lock.release()
+
+
+def train_run(args: argparse.Namespace, run_dir: Path, lock: RunLock) -> int:
     tokenizer_dir = args.data_root / "tokenizer"
     manifest_path = args.data_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -456,6 +587,16 @@ def main(argv: list[str] | None = None) -> int:
         tb = SummaryWriter(run_dir / "tb", purge_step=start_step)
     except ImportError:
         tb = None
+    tracker = Tracker(
+        args,
+        config={
+            "attn": args.attn_label, "size": args.size, "seed": args.seed, "n_params": n_params,
+            "lr": args.lr, "batch_tokens": tokens_per_step, "max_steps": args.max_steps,
+            "micro_batch": args.micro_batch, "precision": str(amp_dtype or torch.float32),
+            "gpu": torch.cuda.get_device_name() if args.device.startswith("cuda") else None,
+        },
+        run_dir=run_dir,
+    )
     step_fn_model = torch.compile(model) if args.compile else model
     noisy = args.attn_type == "noisy"
     noisy_lambda = args.noisy_lambda or 0.0
@@ -470,9 +611,13 @@ def main(argv: list[str] | None = None) -> int:
         diag = noisy_diagnostics(model, val.get(np.arange(min(2, val.n_windows))).to(args.device), amp_dtype)
         with open(noisy_log, "a") as fh:
             fh.write(json.dumps({"step": step, **diag}) + "\n")
+        theta = np.asarray(diag["theta"])
+        metrics = {"noisy/penalty": diag["penalty"], "noisy/theta_mean": float(theta.mean()),
+                   "noisy/theta_min": float(theta.min()), "noisy/theta_max": float(theta.max())}
         if tb is not None:
-            tb.add_scalar("noisy/penalty", diag["penalty"], step)
-            tb.add_scalar("noisy/theta_mean", float(np.mean(diag["theta"])), step)
+            for key, value in metrics.items():
+                tb.add_scalar(key, value, step)
+        tracker.log(metrics, step)
 
     if noisy and start_step == 0:
         log_noisy(0)
@@ -537,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.device.startswith("cuda") else "",
             }
             log.write(row)
+            lock.heartbeat()
             print(" ".join(f"{k}={v}" for k, v in row.items() if v != ""), flush=True)
             if tb is not None:
                 tb.add_scalar("train/loss", row["train_loss"], step)
@@ -545,6 +691,13 @@ def main(argv: list[str] | None = None) -> int:
                 tb.add_scalar("train/tokens_per_s", row["tokens_per_s"], step)
                 if val_loss is not None:
                     tb.add_scalar("val/loss", val_loss, step)
+            metrics = {
+                "train/loss": row["train_loss"], "train/lr": lr, "train/grad_norm": grad_norm,
+                "train/tokens_per_s": row["tokens_per_s"], "train/tokens": row["tokens"],
+            }
+            if val_loss is not None:
+                metrics["val/loss"] = val_loss
+            tracker.log(metrics, step)
             window_loss, window_steps, window_t0 = 0.0, 0, time.time()
 
         if step % args.ckpt_every == 0 and step < args.max_steps:
@@ -555,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
             save_resume(resume_path, model, optimizer, scaler, step, args)
             if stop.stop:
                 print(f"{args.run_name}: stopped at step {step}, resume state saved", flush=True)
+                tracker.finish()
                 return EXIT_INTERRUPTED
 
     save_hf(model, run_dir / "final", tokenizer_dir)
@@ -592,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     (run_dir / "DONE").write_text(datetime.now(timezone.utc).isoformat(timespec="seconds") + "\n")
+    tracker.finish()
     resume_path.unlink(missing_ok=True)
     if tb is not None:
         tb.close()

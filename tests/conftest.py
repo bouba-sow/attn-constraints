@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -6,11 +7,16 @@ import torch
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
+# Tests never log to a real wandb project.
+os.environ.pop("WANDB_PROJECT", None)
+os.environ["WANDB_MODE"] = "disabled"
+# Login nodes are shared: many intra-op threads make small CPU tests orders of magnitude slower.
+torch.set_num_threads(min(4, torch.get_num_threads()))
 
 from model.configuration import ATTN_TYPES, ConstrainedOPTConfig  # noqa: E402
 from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights  # noqa: E402
 
-# The five stage-1 grid types plus window (the hard N-gram models; window3-5 in the stage-2 grid).
+# All attention types: window (stage 1 grid N = 6, 10, 14; stage 2 N = 3, 4, 5) and noisy included.
 ALL_TYPES = ATTN_TYPES
 
 
@@ -24,6 +30,8 @@ def tiny_config(attn_type: str, **overrides) -> ConstrainedOPTConfig:
         ffn_dim=64,
         max_position_embeddings=32,
     )
+    if attn_type == "window":
+        kw["window_size"] = 3
     kw.update(overrides)
     return ConstrainedOPTConfig(**kw)
 
