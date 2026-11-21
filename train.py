@@ -19,6 +19,7 @@ code 99. A finished run writes ``DONE`` and is skipped when relaunched.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import json
@@ -40,7 +41,7 @@ import transformers
 
 from model.checkpoint import save_hf
 from model.configuration import ATTN_TYPES, SIZES, make_config
-from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights
+from model.modeling import ConstrainedOPTForCausalLM, init_matched_weights, noisy_precision_penalty
 
 REPO_DIR = Path(__file__).resolve().parent
 EXIT_INTERRUPTED = 99
@@ -72,17 +73,33 @@ RECIPES = {
 DEFAULT_RECIPE = {"2l": "stage1", "4l": "stage1", "125m": "opt"}
 
 
-def parse_attn(attn: str, parser: argparse.ArgumentParser | None = None) -> tuple[str, int | None]:
-    """'forget' -> ('forget', None); 'window4' -> ('window', 4); plain 'window' keeps the config default (3)."""
-    if attn in ATTN_TYPES:
-        return attn, None
+NOISY_SPEC = re.compile(r"noisy_l((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)")
+
+
+def parse_attn_spec(attn: str, parser: argparse.ArgumentParser | None = None) -> tuple[str, int | None, float | None]:
+    """--attn -> (attn_type, window_size, noisy_lambda).
+
+    'forget' -> ('forget', None, None); 'window4' -> ('window', 4, None) (plain 'window' keeps the
+    config default, 3); 'noisy_l0.01' -> ('noisy', None, 0.01). A noisy model needs its lambda in
+    the name (noisy_l0, noisy_l0.001, ..., noisy_l1), so run names say which constraint they used.
+    """
+    if attn in ATTN_TYPES and attn != "noisy":
+        return attn, None, None
     m = re.fullmatch(r"window([1-9][0-9]*)", attn)
-    if m is None:
-        msg = f"--attn must be one of {ATTN_TYPES} or windowN, got {attn!r}"
-        if parser is not None:
-            parser.error(msg)
-        raise ValueError(msg)
-    return "window", int(m.group(1))
+    if m is not None:
+        return "window", int(m.group(1)), None
+    m = NOISY_SPEC.fullmatch(attn)
+    if m is not None:
+        return "noisy", None, float(m.group(1))
+    msg = f"--attn must be one of {tuple(a for a in ATTN_TYPES if a != 'noisy')}, windowN or noisy_l<lambda>, got {attn!r}"
+    if parser is not None:
+        parser.error(msg)
+    raise ValueError(msg)
+
+
+def parse_attn(attn: str, parser: argparse.ArgumentParser | None = None) -> tuple[str, int | None]:
+    """(attn_type, window_size) of ``parse_attn_spec``."""
+    return parse_attn_spec(attn, parser)[:2]
 
 
 def default_root(name: str) -> Path | None:
@@ -93,8 +110,10 @@ def default_root(name: str) -> Path | None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--attn", required=True, metavar="ATTN",
-                   help=f"one of {ATTN_TYPES}, or windowN (window attention over the last N tokens, "
-                        "current one included: the hard N-gram models, e.g. window3)")
+                   help=f"one of {tuple(a for a in ATTN_TYPES if a != 'noisy')}, windowN (window attention "
+                        "over the last N tokens, current one included: the hard N-gram models, e.g. window3), "
+                        "or noisy_l<lambda> (Xu et al. 2026 noisy attention with penalty weight lambda, "
+                        "e.g. noisy_l0.01)")
     p.add_argument("--size", required=True, choices=tuple(SIZES))
     p.add_argument("--seed", required=True, type=int)
     p.add_argument("--data-root", type=Path, default=default_root("data"))
@@ -130,8 +149,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None, help="torch.compile the model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--noise-val-samples", type=int, default=1,
+                   help="noisy only: noise draws averaged for the periodic validation loss (1 = one draw, as Xu "
+                        "et al.; 0 = noise off). The final evaluation always reports noise off and K = 16.")
+    p.add_argument("--noise-final-windows", type=int, default=512,
+                   help="noisy only: validation windows for the final K = 16 evaluation (16 passes each)")
     args = p.parse_args(argv)
-    args.attn_type, args.window_size = parse_attn(args.attn, p)
+    args.attn_type, args.window_size, args.noisy_lambda = parse_attn_spec(args.attn, p)
     args.recipe = args.recipe or DEFAULT_RECIPE[args.size]
     for key, value in RECIPES[args.recipe].items():
         if getattr(args, key) is None:
@@ -206,19 +230,57 @@ def lm_loss(model: torch.nn.Module, windows: torch.Tensor, amp_dtype: torch.dtyp
     return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
 
+@contextlib.contextmanager
+def noise_eval_samples(model: ConstrainedOPTForCausalLM, k: int):
+    """Temporarily set how a noisy model is evaluated (K draws averaged; 0 = noise off)."""
+    old = model.config.noise_eval_samples
+    model.config.noise_eval_samples = k
+    try:
+        yield
+    finally:
+        model.config.noise_eval_samples = old
+
+
 @torch.no_grad()
-def evaluate(model, val: TokenWindows, args, amp_dtype) -> float:
+def evaluate(model, val: TokenWindows, args, amp_dtype, max_windows: int | None = None, batch_size: int | None = None) -> float:
     """Mean next-token loss over (the first eval_max_windows of) the validation windows."""
     model.eval()
-    n = val.n_windows if args.eval_max_windows is None else min(val.n_windows, args.eval_max_windows)
+    cap = args.eval_max_windows if max_windows is None else max_windows
+    n = val.n_windows if cap is None else min(val.n_windows, cap)
+    bs = batch_size or args.eval_batch
     total, count = 0.0, 0
-    for start in range(0, n, args.eval_batch):
-        idx = np.arange(start, min(n, start + args.eval_batch))
+    for start in range(0, n, bs):
+        idx = np.arange(start, min(n, start + bs))
         batch = val.get(idx).to(args.device, non_blocking=True)
         total += lm_loss(model, batch, amp_dtype).item() * len(idx)
         count += len(idx)
     model.train()
     return total / count
+
+
+@torch.no_grad()
+def noisy_diagnostics(model: ConstrainedOPTForCausalLM, batch: torch.Tensor, amp_dtype) -> dict:
+    """Per layer and head: decay rate theta = softplus(.) and the noise std at distances 0/10/100
+    (1 / sqrt(tau)); per layer: RMS of the value vectors on ``batch`` (the noise std only means
+    something relative to it, i.e. the signal-to-noise ratio). Plus the penalty term."""
+    rms = []
+    hooks = [a.v_proj.register_forward_hook(lambda m, i, o: rms.append(float(o.float().pow(2).mean().sqrt())))
+             for a in model.noisy_attentions()]
+    was_training = model.training
+    model.eval()
+    try:
+        with noise_eval_samples(model, 0), torch.autocast(device_type=batch.device.type, dtype=amp_dtype or torch.float32,
+                                                          enabled=amp_dtype is not None):
+            model(input_ids=batch[:, :-1])
+    finally:
+        for h in hooks:
+            h.remove()
+        model.train(was_training)
+    cfg = model.config
+    theta = [a.decay_rate().tolist() for a in model.noisy_attentions()]
+    std_at = {f"noise_std_d{d}": [[(cfg.noisy_tau0 * math.exp(-t * d) + cfg.noisy_tau_floor) ** -0.5 for t in layer]
+                                  for layer in theta] for d in (0, 10, 100)}
+    return {"penalty": float(noisy_precision_penalty(model)), "theta": theta, "value_rms": rms, **std_at}
 
 
 def git_commit() -> dict[str, str | bool | None]:
@@ -288,6 +350,8 @@ def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
     keys = ("attn", "size", "seed", "recipe", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr", "schedule",
             "warmup_frac", "warmup_steps", "adam_eps", "init_std", "init_output_scale", "tie_embeddings",
             "weight_decay", "beta1", "beta2", "grad_clip")
+    if args.attn_type == "noisy":
+        keys = (*keys, "noisy_lambda")
     changed = {k: (saved.get(k), str(getattr(args, k))) for k in keys if saved.get(k) != str(getattr(args, k))}
     if changed:
         raise SystemExit(f"resume.pt was written with different settings: {changed}")
@@ -313,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
 
     torch.manual_seed(args.seed)
     window_kw = {} if args.window_size is None else {"window_size": args.window_size}
+    if args.noisy_lambda is not None:
+        window_kw["noisy_lambda"] = args.noisy_lambda
     config = make_config(
         args.attn_type,
         args.size,
@@ -391,6 +457,25 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         tb = None
     step_fn_model = torch.compile(model) if args.compile else model
+    noisy = args.attn_type == "noisy"
+    noisy_lambda = args.noisy_lambda or 0.0
+    # Noisy evaluation averages over a seeded generator: run it eagerly (not through torch.compile).
+    eval_model = model if noisy else step_fn_model
+    noisy_log = run_dir / "noisy_log.jsonl"
+    if noisy and start_step > 0 and noisy_log.exists():
+        rows = [r for r in noisy_log.read_text().splitlines() if r and json.loads(r)["step"] <= start_step]
+        noisy_log.write_text("".join(r + "\n" for r in rows))
+
+    def log_noisy(step: int) -> None:
+        diag = noisy_diagnostics(model, val.get(np.arange(min(2, val.n_windows))).to(args.device), amp_dtype)
+        with open(noisy_log, "a") as fh:
+            fh.write(json.dumps({"step": step, **diag}) + "\n")
+        if tb is not None:
+            tb.add_scalar("noisy/penalty", diag["penalty"], step)
+            tb.add_scalar("noisy/theta_mean", float(np.mean(diag["theta"])), step)
+
+    if noisy and start_step == 0:
+        log_noisy(0)
     stop = StopFlag()
     n_micro = args.batch_seqs // args.micro_batch
     window_loss, window_steps = 0.0, 0
@@ -406,9 +491,15 @@ def main(argv: list[str] | None = None) -> int:
         batch = batch.pin_memory().to(args.device, non_blocking=True) if args.device.startswith("cuda") else batch
         step_loss = 0.0
         for micro in batch.split(args.micro_batch):
-            loss = lm_loss(step_fn_model, micro, amp_dtype) / n_micro
-            scaler.scale(loss).backward()
-            step_loss += loss.item()
+            ce = lm_loss(step_fn_model, micro, amp_dtype)
+            loss = ce
+            if noisy and noisy_lambda > 0:
+                # Xu et al.'s hybrid loss: cross-entropy + lambda * mean precision. The penalty only
+                # depends on theta, so adding it to every micro-batch (each scaled by 1/n_micro) adds
+                # it once per optimizer step. train_loss logs the cross-entropy alone.
+                loss = ce + noisy_lambda * noisy_precision_penalty(model)
+            scaler.scale(loss / n_micro).backward()
+            step_loss += ce.item() / n_micro
         if not math.isfinite(step_loss):
             raise SystemExit(f"{args.run_name}: non-finite loss at step {step}")
         scaler.unscale_(optimizer)
@@ -426,7 +517,10 @@ def main(argv: list[str] | None = None) -> int:
 
         val_loss = None
         if step % args.eval_every == 0 or step == args.max_steps:
-            val_loss = evaluate(step_fn_model, val, args, amp_dtype)
+            with noise_eval_samples(model, args.noise_val_samples) if noisy else contextlib.nullcontext():
+                val_loss = evaluate(eval_model, val, args, amp_dtype)
+            if noisy:
+                log_noisy(step)
         if step % args.log_every == 0 or val_loss is not None or step == args.max_steps:
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -469,6 +563,20 @@ def main(argv: list[str] | None = None) -> int:
     steady = None
     if steady_t0 is not None and step > steady_step0:
         steady = (step - steady_step0) * tokens_per_step / (time.time() - steady_t0)
+    extra = {}
+    if noisy:
+        # final_val_loss above used --noise-val-samples draws; report both evaluation modes too.
+        k = model.config.noise_eval_samples
+        nw = args.noise_final_windows
+        with noise_eval_samples(model, 0):
+            off_all = evaluate(model, val, args, amp_dtype)
+            off_sub = evaluate(model, val, args, amp_dtype, max_windows=nw)
+        with noise_eval_samples(model, k):
+            k_sub = evaluate(model, val, args, amp_dtype, max_windows=nw, batch_size=max(1, args.eval_batch // 4))
+        extra["noisy_final_val"] = {"noise_off": off_all, f"noise_off_first{nw}": off_sub, f"k{k}_first{nw}": k_sub,
+                                    "noise_val_samples_in_log": args.noise_val_samples}
+        print(f"{args.run_name}: val noise off {off_all:.4f}; first {nw} windows: off {off_sub:.4f}, K={k} {k_sub:.4f}",
+              flush=True)
     write_json_atomic(
         run_dir / "summary.json",
         {
@@ -476,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
             "steps": step,
             "tokens": step * tokens_per_step,
             "final_val_loss": val_loss,
+            **extra,
             "tokens_per_s_steady": None if steady is None else round(steady),
             "peak_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)
             if args.device.startswith("cuda") else None,

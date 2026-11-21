@@ -16,6 +16,12 @@ Attention types (s_ij = q_i . k_j / sqrt(d_head), causal j <= i):
 * ``stickbreaking``: A_ij = sigmoid(s_ij) prod_{j<k<=i} (1 - sigmoid(s_ik)), no softmax and
   no renormalization (rows sum to <= 1).
 * ``window``: softmax(s) with keys restricted to i - n < j <= i (pilot sanity check only).
+* ``noisy`` (Xu, Dillon & Futrell 2026): vanilla attention whose head output gets Gaussian
+  noise, z_i = sum_j a_ij v_j + sigma_i * eps, sigma_i^2 = sum_j a_ij^2 / tau_ij,
+  tau_ij = tau0 exp(-theta_h (i - j)) + tau_floor (their reparameterization of noisy value
+  vectors), with a learned decay rate theta_h = softplus(.) per head and a precision penalty
+  (``noisy_precision_penalty``) added to the training loss. Noise is sampled in training; at
+  evaluation see ``ConstrainedOPTConfig.noise_eval_samples``.
 
 Scores, masks, softmax and cumulative sums run in fp32 even under bf16 autocast, as explicit
 T x T tensors (no custom kernels, no flash attention), so any GPU works.
@@ -38,7 +44,9 @@ POSITION_OFFSET = 2
 
 # Parameters that exist only for some attention types. They are initialized from a separate
 # generator so the shared weights are bit-identical across attention types within a seed.
-CONSTRAINT_PARAM_KEYS = ("fgate_proj", "embed_positions")
+CONSTRAINT_PARAM_KEYS = ("fgate_proj", "embed_positions", "noisy_theta")
+# Xu et al.'s code initializes theta (before softplus) as init + 1e-3 * N(0, 1).
+NOISY_THETA_INIT_STD = 1e-3
 
 
 def alibi_slopes(n_heads: int) -> list[float]:
@@ -67,6 +75,35 @@ def stickbreaking_weights(scores: torch.Tensor, allowed: torch.Tensor) -> torch.
     return torch.exp(log_beta + exclusive).masked_fill(~allowed, 0.0)
 
 
+def noisy_variance(theta: torch.Tensor, distance: torch.Tensor, tau0: float, tau_floor: float) -> torch.Tensor:
+    """Per-pair noise variance 1 / tau_ij, tau_ij = tau0 * exp(-theta_h * d_ij) + tau_floor.
+
+    ``theta`` is the positive decay rate (h,), ``distance`` the (t, t) matrix of i - j clamped at 0
+    (entries above the diagonal get attention weight 0, so their value does not matter). Returns
+    (1, h, t, t). The floor is Xu et al.'s ("added to every tau_qk to avoid numerical underflow").
+    """
+    tau = tau0 * torch.exp(-theta.view(-1, 1, 1) * distance.float()) + tau_floor
+    return (1.0 / tau)[None]
+
+
+def noisy_output_std(weights: torch.Tensor, variance: torch.Tensor) -> torch.Tensor:
+    """sigma_i = sqrt(sum_j a_ij^2 / tau_ij): std of the noise on each head output, (b, h, t, 1)."""
+    return torch.sqrt((weights * weights * variance).sum(-1, keepdim=True))
+
+
+def precision_penalty_terms(theta: torch.Tensor, ref_len: int, tau0: float) -> tuple[torch.Tensor, int]:
+    """Sum and count of tau0 * exp(-theta_h * (q - k)) over 0 <= k <= q < ref_len and heads.
+
+    Closed form of Xu et al.'s ``precision_regularizer_sum`` (train_noisy.py): a distance d occurs
+    ref_len - d times; the count is n_heads * ref_len (ref_len + 1) / 2 (their code counts the
+    diagonal, unlike the T (T - 1) / 2 of their Eq. 9). No floor, as in their code.
+    """
+    d = torch.arange(ref_len, device=theta.device, dtype=torch.float32)
+    tau = tau0 * torch.exp(-theta.float().view(-1, 1) * d)  # (h, ref_len)
+    total = (tau * (ref_len - d)).sum()
+    return total, theta.numel() * ref_len * (ref_len + 1) // 2
+
+
 class ConstrainedOPTAttention(nn.Module):
     def __init__(self, config: ConstrainedOPTConfig):
         super().__init__()
@@ -91,6 +128,19 @@ class ConstrainedOPTAttention(nn.Module):
         if self.attn_type == "forget":
             # FoX "full" forget gate: one scalar gate per head from the (post-LayerNorm) input.
             self.fgate_proj = nn.Linear(self.embed_dim, self.num_heads, bias=True)
+        if self.attn_type == "noisy":
+            # Decay rate before softplus, one per head (init_matched_weights sets init + 1e-3 N(0,1)).
+            self.noisy_theta = nn.Parameter(torch.full((self.num_heads,), float(config.noisy_theta_init)))
+            self.noisy_tau0 = float(config.noisy_tau0)
+            self.noisy_tau_floor = float(config.noisy_tau_floor)
+            # Noise is on in training mode. At evaluation it is on only while the causal-LM wrapper
+            # averages over noise draws (noise_eval_active), drawn from noise_generator.
+            self.noise_eval_active = False
+            self.noise_generator: torch.Generator | None = None
+
+    def decay_rate(self) -> torch.Tensor:
+        """theta_h = softplus(noisy_theta) > 0, (h,)."""
+        return F.softplus(self.noisy_theta.float())
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
@@ -109,6 +159,12 @@ class ConstrainedOPTAttention(nn.Module):
             scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # (b, h, t, t)
             weights = self.attention_weights(scores, key_padding_mask, fgate)
             out = torch.matmul(weights, v)
+            if self.attn_type == "noisy" and (self.training or self.noise_eval_active):
+                pos = torch.arange(t, device=scores.device)
+                distance = (pos[:, None] - pos[None, :]).clamp(min=0)
+                variance = noisy_variance(self.decay_rate(), distance, self.noisy_tau0, self.noisy_tau_floor)
+                eps = torch.randn(out.shape, dtype=out.dtype, device=out.device, generator=self.noise_generator)
+                out = out + noisy_output_std(weights, variance) * eps
 
         out = out.to(out_dtype).transpose(1, 2).reshape(b, t, self.embed_dim)
         return self.out_proj(out)
@@ -283,8 +339,14 @@ class ConstrainedOPTForCausalLM(ConstrainedOPTPreTrainedModel):
         return_dict: bool | None = None,
         **kwargs,  # use_cache, past_key_values, ...: accepted and ignored (no KV cache)
     ) -> CausalLMOutputWithPast:
-        last, hidden = self.model.decoder(input_ids, attention_mask, bool(output_hidden_states))
-        logits = self.lm_head(last)
+        n_samples = self.config.noise_eval_samples if self.config.attn_type == "noisy" else 0
+        if self.training or n_samples <= 0:
+            # Training (noisy: one noise draw per pass), every non-noisy type, and noisy with the
+            # noise off at evaluation.
+            last, hidden = self.model.decoder(input_ids, attention_mask, bool(output_hidden_states))
+            logits = self.lm_head(last)
+        else:
+            logits, hidden = self._noisy_eval_logits(input_ids, attention_mask, n_samples, bool(output_hidden_states))
         loss = None
         if labels is not None:
             # HF convention: labels are the input ids; predict token t+1 from positions <= t.
@@ -294,6 +356,48 @@ class ConstrainedOPTForCausalLM(ConstrainedOPTPreTrainedModel):
                 ignore_index=-100,
             )
         return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=hidden)
+
+    def noisy_attentions(self) -> list[ConstrainedOPTAttention]:
+        return [layer.self_attn for layer in self.model.decoder.layers if layer.self_attn.attn_type == "noisy"]
+
+    @torch.no_grad()
+    def _noisy_eval_logits(
+        self, input_ids: torch.LongTensor, attention_mask: torch.Tensor | None, n_samples: int, want_hidden: bool
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+        """log((1/K) sum_k softmax(logits_k)) over K noise draws from a generator seeded with
+        ``noise_eval_seed`` at every call, so the same input gives the same output. Hidden states,
+        if requested, come from an extra pass with the noise off (the benchmark reads the logits).
+        """
+        attns = self.noisy_attentions()
+        generator = torch.Generator(device=input_ids.device).manual_seed(int(self.config.noise_eval_seed))
+        acc = None
+        try:
+            for attn in attns:
+                attn.noise_eval_active, attn.noise_generator = True, generator
+            for _ in range(n_samples):
+                last, _ = self.model.decoder(input_ids, attention_mask, False)
+                logp = F.log_softmax(self.lm_head(last).float(), dim=-1)
+                acc = logp if acc is None else torch.logaddexp(acc, logp)
+        finally:
+            for attn in attns:
+                attn.noise_eval_active, attn.noise_generator = False, None
+        hidden = self.model.decoder(input_ids, attention_mask, True)[1] if want_hidden else None
+        return acc - math.log(n_samples), hidden
+
+
+def noisy_precision_penalty(model: ConstrainedOPTForCausalLM) -> torch.Tensor:
+    """Mean precision over all (q, k <= q) pairs of a ``noisy_ref_len`` window, heads and layers:
+    the memory term of Xu et al.'s loss, which is multiplied by ``noisy_lambda``. It depends on
+    the decay rates only, not on the data. Gradients flow into ``noisy_theta``.
+    """
+    cfg = model.config
+    total, count = 0.0, 0
+    for attn in model.noisy_attentions():
+        s, n = precision_penalty_terms(attn.decay_rate(), cfg.noisy_ref_len, cfg.noisy_tau0)
+        total, count = total + s, count + n
+    if count == 0:
+        raise ValueError("noisy_precision_penalty needs a model with attn_type='noisy'")
+    return total / count
 
 
 def is_constraint_param(name: str) -> bool:
@@ -326,7 +430,11 @@ def init_matched_weights(model: ConstrainedOPTForCausalLM, seed: int) -> None:
     shared = torch.Generator().manual_seed(seed)
     extra = torch.Generator().manual_seed(seed + 1000)
     for name, param in model.named_parameters():
-        if name.endswith(".bias"):
+        if name.endswith("noisy_theta"):
+            # Xu et al.: theta (before softplus) = init + 1e-3 * N(0, 1).
+            values = torch.empty(param.shape, dtype=torch.float32).normal_(0.0, NOISY_THETA_INIT_STD, generator=extra)
+            param.copy_(values + model.config.noisy_theta_init)
+        elif name.endswith(".bias"):
             param.zero_()
         elif "layer_norm" in name:
             param.fill_(1.0)

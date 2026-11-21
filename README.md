@@ -31,6 +31,8 @@ With s_ij = q_i·k_j/√d_head and causal masking (j ≤ i):
 | `stickbreaking` | A_ij = σ(s_ij) ∏_{j<k≤i}(1 − σ(s_ik)); the current token is included, no softmax, no renormalization (rows sum to ≤ 1) |
 | `windowN` (stage 2: N = 3, 4, 5; plain `window` = 3) | vanilla with keys restricted to i − N < j ≤ i: the hard N-gram models (N tokens visible per layer, current one included; Bu et al.'s `window_size` convention). Over L layers the receptive field is L(N − 1) + 1 tokens: 25 / 37 / 49 at 12 layers |
 
+| `noisy_l<λ>` (λ = 0, 0.001, 0.01, 0.1, 1) | vanilla weights; the head output gets Gaussian noise (Xu, Dillon & Futrell 2026; see "Noisy attention") |
+
 Scores, masks, softmax and cumulative sums are computed in fp32 inside bf16 autocast as explicit
 T×T tensors: no custom kernels, so any GPU works.
 
@@ -45,7 +47,7 @@ pre-LayerNorm, ReLU, dropout 0, init std 0.02, biases 0):
 
 **Matched initialization.** `init_matched_weights` draws every shared parameter from a generator
 seeded with `seed`, in module order, and the constraint-only parameters (forget-gate projection,
-position table) from a second generator seeded with `seed + 1000`. Within a seed, the shared
+position table, noisy decay rates) from a second generator seeded with `seed + 1000`. Within a seed, the shared
 weights are bit-identical across attention types (tested).
 
 **Data and training.**
@@ -277,6 +279,51 @@ returns L + 1 states as HF OPT does (the last one after the final LayerNorm). Th
 cache: `use_cache` is accepted and ignored. ALiBi slopes can be scaled at load time with
 `from_pretrained(..., alibi_slope_scale=0.0)`.
 
+## Noisy attention (Xu, Dillon & Futrell 2026; 125m on NYU Torch)
+
+Xu, Dillon & Futrell (2026, ACL), "Memory efficiency and resource-rational encoding in sentence
+processing" ([code](https://github.com/weijiexu-charlie/resource-rational-encoding)), as an extra
+attention type on top of `vanilla` (NoPE), trained with the same 125m OPT recipe and 5.0B Pile
+tokens as the rest of stage 2:
+
+- Head output z_i = Σ_j a_ij v_j + σ_i ε, ε ~ N(0, I), σ_i² = Σ_j a_ij² / τ_ij (their
+  reparameterization of noisy value vectors), τ_ij = τ₀ exp(−θ_h (i − j)) + 10⁻⁴, τ₀ = 10⁴
+  (σ = 0.01 at distance 0), θ_h = softplus(·) learned per head, initialized at 1 + 10⁻³ N(0, 1)
+  (their code), no weight decay.
+- Loss = cross-entropy + λ × mean τ over all (q, k ≤ q) pairs of a fixed **512-token** window,
+  heads and layers (their `precision_regularizer_sum`, closed form). The penalty depends only on
+  θ, and with a longer window the same θ gives a ~1/T smaller mean: computing it on their 512-token
+  window keeps their λ values meaningful while training at context 2048. `train_loss` and
+  `val_loss` in `train_log.csv` are the cross-entropy alone.
+- Evaluation (`noise_eval_samples` in `config.json`, 16 by default): log of the mean next-token
+  probability over 16 noise draws from a generator seeded at every call (the model's predictive
+  distribution under its noisy memory; reproducible). `noise_eval_samples = 0` turns the noise
+  off. Their released models sample one fresh draw per forward pass, also at inference.
+  `hidden_states` come from a pass with the noise off. The periodic `val_loss` uses
+  `--noise-val-samples` draws (default 1, as in their training log); `summary.json` adds
+  `noisy_final_val` (noise off on all of `val.bin`, and noise off vs K = 16 on the first 512 windows).
+- Diagnostics: `noisy_log.jsonl` (every `--eval-every` steps): θ per layer and head, the noise
+  std at distances 0 / 10 / 100, the penalty, and the RMS of the value vectors (the noise std only
+  matters relative to it).
+
+**Grid**: {vanilla, noisy_l0, noisy_l0.001, noisy_l0.01, noisy_l0.1, noisy_l1} × 125m × seeds 1–3 =
+18 runs, all on NYU (every type of a seed on the same machine; `vanilla` s1–s3 are retrained there,
+which also measures how much the cluster alone moves the results). λ = 0 has the noise without
+the penalty: it separates "adding noise" from "constraining precision".
+
+```bash
+# 1. Jean Zay's 125m data (5.1B tokens), then check it against the manifest:
+rsync -avP jeanzay:/lustre/fsn1/projects/rech/ldh/una68ug/attn_constraints/data/{train.bin,val.bin,manifest.json,tokenizer} $SCRATCH/attn_constraints/data/
+.venv/bin/python tools/check_data.py $SCRATCH/attn_constraints/data
+# 2. pilot (one H200, ~15 min per type): tok/s, peak memory, loss stable; in each run's
+#    noisy_log.jsonl theta must rise from its init, faster for larger lambda
+GRID_ATTNS="vanilla noisy_l0 noisy_l0.01 noisy_l1" GRID_SIZES=125m TRAIN_ARGS="--noise-final-windows 32" sbatch slurm/pilot.sh
+# 3. grid: one run per GPU (6 types x 3 seeds = 18 array tasks)
+GRID_ATTNS="vanilla noisy_l0 noisy_l0.001 noisy_l0.01 noisy_l0.1 noisy_l1" GRID_SIZES=125m GRID_SEEDS="1 2 3" \
+  RUNS_PER_GPU=1 sbatch --array=0-17 slurm/train_gpu.sh
+.venv/bin/python evaluate.py $RUNS_ROOT/noisy_l*_125m_s*/final --noise-samples 0 16 --max-windows 512
+```
+
 ## Tests
 
 `uv run pytest` (CPU, a few minutes):
@@ -289,6 +336,10 @@ cache: `use_cache` is accepted and ignored. ALiBi slopes can be scaled at load t
 - Save, then load in a fresh process with `trust_remote_code`, gives the same logits (all types).
 - Tokenization round trip, with `<|endoftext|>` count = document count.
 - Training on synthetic data: the loss decreases, and a killed run resumes to bit-identical weights.
+- Noisy attention: the penalty equals Xu et al.'s `precision_regularizer_sum`; σ_i matches an
+  explicit loop; noise off (or negligible noise) gives `vanilla`; evaluation is reproducible and
+  equals the mean probability over K draws; a short run raises θ under the penalty and writes
+  the diagnostics and both final evaluations.
 
 ## Stage 2 (same code)
 

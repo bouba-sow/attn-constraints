@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from transformers import OPTConfig
 
-ATTN_TYPES = ("vanilla", "vanilla_pos", "alibi", "forget", "stickbreaking", "window")
+ATTN_TYPES = ("vanilla", "vanilla_pos", "alibi", "forget", "stickbreaking", "window", "noisy")
 
 # Stage 1 (2l, 4l) and stage 2 (125m). Vocab is the Pythia/GPT-NeoX tokenizer padded to 50,304.
 SIZES = {
@@ -28,6 +28,13 @@ class ConstrainedOPTConfig(OPTConfig):
         window_size: int = 3,
         alibi_slope_scale: float = 1.0,
         init_output_scale: bool = False,
+        noisy_lambda: float = 0.0,
+        noisy_tau0: float = 1e4,
+        noisy_tau_floor: float = 1e-4,
+        noisy_theta_init: float = 1.0,
+        noisy_ref_len: int = 512,
+        noise_eval_samples: int = 16,
+        noise_eval_seed: int = 0,
         **kwargs,
     ):
         if attn_type not in ATTN_TYPES:
@@ -41,6 +48,23 @@ class ConstrainedOPTConfig(OPTConfig):
         # OPT / Megatron-LM init: the residual-branch output projections (self_attn.out_proj,
         # fc2) use init_std / sqrt(2 * num_hidden_layers). Off for stage 1, on for the OPT recipe.
         self.init_output_scale = init_output_scale
+        # Only used by attn_type="noisy" (Xu, Dillon & Futrell 2026, ACL; github.com/weijiexu-charlie/
+        # resource-rational-encoding): Gaussian noise on each head's output whose variance grows with
+        # query-key distance, precision tau_qk = tau0 * exp(-theta_h (q - k)) (+ tau_floor), theta_h =
+        # softplus(learned), and a penalty lambda * mean(tau) over a fixed window of noisy_ref_len
+        # tokens added to the loss (their normalization window, so lambda keeps their meaning at any
+        # training context). Their values: tau0 1e4, floor 1e-4, theta init 1.0, window 512.
+        self.noisy_lambda = noisy_lambda
+        self.noisy_tau0 = noisy_tau0
+        self.noisy_tau_floor = noisy_tau_floor
+        self.noisy_theta_init = noisy_theta_init
+        self.noisy_ref_len = noisy_ref_len
+        # Evaluation of a noisy model (training always samples one noise draw per forward pass):
+        # K > 0 returns log of the mean next-token probability over K seeded noise draws (the
+        # model's predictive distribution under its noisy memory; reproducible), K = 0 turns the
+        # noise off (deterministic attention output).
+        self.noise_eval_samples = noise_eval_samples
+        self.noise_eval_seed = noise_eval_seed
         kwargs.setdefault("vocab_size", 50304)
         kwargs.setdefault("max_position_embeddings", 1024)
         kwargs.setdefault("do_layer_norm_before", True)

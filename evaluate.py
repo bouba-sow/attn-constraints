@@ -3,7 +3,8 @@
 Loads each checkpoint with ``AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)``
 and reports the mean next-token loss on ``val.bin`` (same windows as training). ``--alibi-check``
 also evaluates ALiBi checkpoints with their slopes set to 0: the loss must get worse, otherwise
-the model ignores its bias.
+the model ignores its bias. Noisy checkpoints are evaluated as saved (K noise draws averaged,
+config ``noise_eval_samples``) and, with ``--noise-samples 0 16``, in each listed mode (0 = noise off).
 
     uv run python evaluate.py $RUNS_ROOT/alibi_4l_s1/final --alibi-check
 """
@@ -48,6 +49,8 @@ def main() -> None:
     p.add_argument("--max-windows", type=int, default=None)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--alibi-check", action="store_true", help="also evaluate ALiBi models with slopes = 0")
+    p.add_argument("--noise-samples", type=int, nargs="+", default=None,
+                   help="noisy models: evaluate with each K (noise draws averaged; 0 = noise off)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -66,6 +69,12 @@ def main() -> None:
             seq_len = model.config.max_position_embeddings
             loss = val_loss(model, tokens, seq_len, args.batch, args.max_windows, args.device)
             row["val_loss" if scale == 1.0 else "val_loss_slopes0"] = round(loss, 5)
+            if attn_type == "noisy":
+                row["noise_eval_samples"] = model.config.noise_eval_samples
+                for k in args.noise_samples or []:
+                    model.config.noise_eval_samples = k
+                    row[f"val_loss_noise_k{k}"] = round(
+                        val_loss(model, tokens, seq_len, args.batch, args.max_windows, args.device), 5)
             del model
         if "val_loss_slopes0" in row:
             row["alibi_uses_bias"] = row["val_loss_slopes0"] > row["val_loss"]
