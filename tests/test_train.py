@@ -159,3 +159,20 @@ def test_run_lock_blocks_second_process_and_takes_over_stale(data_root, tmp_path
     # A normal run releases its lock when it finishes.
     assert run(args, data_root, tmp_path / "runs") == 0
     assert not (run_dir / "RUNNING").exists() and (run_dir / "DONE").exists()
+
+
+def test_run_lock_taken_over_after_requeue_of_the_same_job(tmp_path, monkeypatch):
+    """A requeued SLURM job keeps its job id; a lock its killed predecessor left is taken over at
+    once, while a fresh lock from a different job still blocks."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("SLURM_JOB_ID", "111")
+    killed = train.RunLock(run_dir)
+    assert killed.acquire()  # the process dies without release(): the lock file stays, fresh
+    monkeypatch.setenv("SLURM_JOB_ID", "222")
+    assert not train.RunLock(run_dir).acquire()  # another job: still blocked
+    monkeypatch.setenv("SLURM_JOB_ID", "111")
+    again = train.RunLock(run_dir)
+    assert again.acquire()  # same job id after a requeue: taken over
+    again.release()
+    assert not (run_dir / "RUNNING").exists()

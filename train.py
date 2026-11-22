@@ -451,11 +451,16 @@ class RunLock:
                     age = time.time() - self.path.stat().st_mtime
                 except FileNotFoundError:
                     continue
-                if age < self.stale_after:
-                    holder = self.path.read_text().strip() if self.path.exists() else "?"
+                holder = self.path.read_text().strip() if self.path.exists() else "?"
+                # A requeued SLURM job keeps its job id and never runs twice at once, so a lock
+                # left by the same job id belongs to this job's previous (killed) incarnation.
+                job = os.environ.get("SLURM_JOB_ID")
+                same_job = job is not None and f"job={job}" in holder.split()
+                if age < self.stale_after and not same_job:
                     print(f"locked by another process ({holder}, heartbeat {age:.0f}s ago)", flush=True)
                     return False
-                print(f"taking over a stale lock (heartbeat {age:.0f}s ago)", flush=True)
+                reason = "left by this job before a requeue" if same_job else f"heartbeat {age:.0f}s ago"
+                print(f"taking over a stale lock ({holder}; {reason})", flush=True)
                 self.path.unlink(missing_ok=True)
                 continue
             with os.fdopen(fd, "w") as fh:
