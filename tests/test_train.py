@@ -176,3 +176,40 @@ def test_run_lock_taken_over_after_requeue_of_the_same_job(tmp_path, monkeypatch
     assert again.acquire()  # same job id after a requeue: taken over
     again.release()
     assert not (run_dir / "RUNNING").exists()
+
+
+def test_window_order_epochs():
+    """One epoch = the single-pass order; several epochs reshuffle, each window at most once per
+    epoch, and epoch 0 equals the single-pass permutation."""
+    n, b = 103, 8
+    single = train.window_order(n, b, 12, seed=5)
+    assert len(set(single.tolist())) == len(single) == 96
+    multi = train.window_order(n, b, 3 * (n // b), seed=5, epochs=3)
+    per_epoch = (n // b) * b
+    assert len(multi) == 3 * per_epoch
+    epochs = [multi[i * per_epoch:(i + 1) * per_epoch] for i in range(3)]
+    for e in epochs:
+        assert len(set(e.tolist())) == per_epoch  # no repeat within an epoch
+    assert not np.array_equal(epochs[0], epochs[1])  # reshuffled
+    assert np.array_equal(epochs[0], np.random.default_rng(5).permutation(n)[:per_epoch])
+    assert np.array_equal(train.window_order(n, b, 12, seed=5, epochs=3)[:96], single)
+    with pytest.raises(SystemExit):
+        train.window_order(n, b, 100, seed=5, epochs=3)
+
+
+def test_multi_epoch_run_sets_steps_and_resumes(data_root, tmp_path, monkeypatch):
+    """--epochs 3 without --max-steps trains 3 x (windows // batch) steps and resumes exactly."""
+    args = ["--attn", "vanilla", *[a for a in COMMON if a not in ("--max-steps", "6")], "--epochs", "3",
+            "--eval-every", "100000"]
+    n_windows = (np.fromfile(data_root / "train.bin", dtype=np.uint16).size) // 33
+    steps = 3 * (n_windows // 4)
+    assert run(args + ["--log-every", "1000"], data_root, tmp_path / "a") == 0
+    cfg = json.loads((tmp_path / "a" / "vanilla_test_s1" / "run_config.json").read_text())
+    assert cfg["args"]["max_steps"] == steps and cfg["args"]["epochs"] == 3
+    monkeypatch.setattr(train, "StopFlag", lambda: StopAfter(steps // 2))
+    assert run(args + ["--log-every", "1000"], data_root, tmp_path / "b") == train.EXIT_INTERRUPTED
+    monkeypatch.setattr(train, "StopFlag", lambda: StopAfter(10**9))
+    assert run(args + ["--log-every", "1000"], data_root, tmp_path / "b") == 0
+    wa = load_file(tmp_path / "a" / "vanilla_test_s1" / "final" / "model.safetensors")
+    wb = load_file(tmp_path / "b" / "vanilla_test_s1" / "final" / "model.safetensors")
+    assert all(torch.equal(wa[k], wb[k]) for k in wa)

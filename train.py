@@ -161,7 +161,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="wandb project for the live dashboard (default: $WANDB_PROJECT; "
                         "unset = no wandb, TensorBoard only)")
     p.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY") or None)
+    p.add_argument("--epochs", type=int, default=1,
+                   help="passes over train.bin, reshuffled each epoch (small corpora such as BabyLM); "
+                        "with > 1, --max-steps defaults to epochs x (windows // batch-seqs)")
     args = p.parse_args(argv)
+    if args.epochs < 1:
+        p.error("--epochs must be >= 1")
+    args.max_steps_explicit = args.max_steps is not None
     # Window models: '--attn window6' (Jean Zay grid) or '--attn window --window-size 6' (Torch launcher).
     args.attn_type, spec_window, args.noisy_lambda = parse_attn_spec(args.attn, p)
     if args.window_size is not None:
@@ -184,6 +190,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.attn_label = f"window{args.window_size}" if args.attn_type == "window" else args.attn
     args.run_name = args.run_name or f"{args.attn_label}_{args.size}_s{args.seed}"
     return args
+
+
+def window_order(n_windows: int, batch_seqs: int, max_steps: int, seed: int, epochs: int = 1) -> np.ndarray:
+    """Training window indices, ``batch_seqs`` per step for ``max_steps`` steps.
+
+    One epoch (the default, every Pile run): the first ``max_steps * batch_seqs`` windows of
+    ``np.random.default_rng(seed).permutation(n_windows)``, so no window is seen twice. Several
+    epochs (small corpora such as BabyLM): epoch 0 is that same permutation and epoch e > 0 is a
+    fresh one from ``default_rng([seed, e])``; each epoch uses ``n_windows // batch_seqs`` full
+    steps, so every window appears at most once per epoch (the few left-over windows differ
+    between epochs). Identical for every attention type and size within a seed.
+    """
+    needed = max_steps * batch_seqs
+    if epochs <= 1:
+        if needed > n_windows:
+            raise SystemExit(f"need {needed:,} windows, train.bin has {n_windows:,}")
+        return np.random.default_rng(seed).permutation(n_windows)[:needed]
+    per_epoch = (n_windows // batch_seqs) * batch_seqs
+    parts = []
+    for epoch in range(epochs):
+        rng = np.random.default_rng(seed) if epoch == 0 else np.random.default_rng([seed, epoch])
+        parts.append(rng.permutation(n_windows)[:per_epoch])
+    order = np.concatenate(parts)
+    if needed > len(order):
+        raise SystemExit(f"need {needed:,} windows, {epochs} epochs give {len(order):,}")
+    return order[:needed]
 
 
 class TokenWindows:
@@ -417,7 +449,7 @@ def save_resume(path: Path, model, optimizer, scaler, step: int, args) -> None:
 def check_resume_args(saved: dict[str, str], args: argparse.Namespace) -> None:
     keys = ("attn", "window_size", "size", "seed", "recipe", "seq_len", "batch_seqs", "max_steps", "lr", "min_lr",
             "schedule", "warmup_frac", "warmup_steps", "adam_eps", "init_std", "init_output_scale", "tie_embeddings",
-            "weight_decay", "beta1", "beta2", "grad_clip")
+            "weight_decay", "beta1", "beta2", "grad_clip", "epochs")
     if args.attn_type == "noisy":
         keys = (*keys, "noisy_lambda")
     # Keys absent from an older resume.pt (written before a setting existed, e.g. stage-1 runs
@@ -506,10 +538,13 @@ def train_run(args: argparse.Namespace, run_dir: Path, lock: RunLock) -> int:
 
     train = TokenWindows(args.data_root / "train.bin", args.seq_len + 1)
     val = TokenWindows(args.data_root / "val.bin", args.seq_len + 1)
-    needed = args.max_steps * args.batch_seqs
-    if needed > train.n_windows:
-        raise SystemExit(f"need {needed:,} windows, train.bin has {train.n_windows:,}")
-    perm = np.random.default_rng(args.seed).permutation(train.n_windows)[:needed]
+    if args.epochs > 1:
+        full_epochs_steps = args.epochs * (train.n_windows // args.batch_seqs)
+        if not args.max_steps_explicit:
+            args.max_steps = full_epochs_steps
+        elif args.max_steps > full_epochs_steps:
+            raise SystemExit(f"--max-steps {args.max_steps} > {args.epochs} epochs = {full_epochs_steps} steps")
+    perm = window_order(train.n_windows, args.batch_seqs, args.max_steps, args.seed, args.epochs)
 
     torch.manual_seed(args.seed)
     window_kw = {} if args.window_size is None else {"window_size": args.window_size}
